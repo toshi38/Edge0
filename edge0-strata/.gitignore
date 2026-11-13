@@ -95,3 +95,6 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+# Apple metal-cpp headers, fetched by metal/setup_mac.py
+/third_party/metal-cpp/
+/third_party/metal-cpp_26.zip
