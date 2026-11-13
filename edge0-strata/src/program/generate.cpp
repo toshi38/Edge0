@@ -257,6 +257,9 @@ struct LatentTab {
             std::fclose(lf);
             if (got != labels.size()) { err = "latent dense: " + lp + " is too small"; return false; }
         }
+#if defined(STRATA_GPU_METAL)   // the Metal window wraps the D/U pack where it is mapped (metal/src/engine/window.cpp, latent_init)
+        return true;
+#else
         const uint64_t db = (uint64_t) g.n_layers * dense.d_bytes(), ub = (uint64_t) g.n_layers * dense.u_bytes();
         if (cudaMalloc((void**) &d, db) != cudaSuccess || cudaMalloc((void**) &u, ub) != cudaSuccess) {
             const cudaError_t ce = cudaGetLastError();
@@ -274,6 +277,7 @@ struct LatentTab {
         strata::core::latent_shared_d() = d;
         strata::core::latent_shared_u() = u;
         return true;
+#endif
     }
 } lat_tab;
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,

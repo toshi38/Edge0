@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <fcntl.h>
 #include <filesystem>
 #include <functional>
 #include <signal.h>
@@ -102,6 +103,8 @@ struct MoeArgs {
 struct GdnArgs { uint32_t h_k, h_v, channels, commit; float eps; uint32_t plane; };
 struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; };
 struct GlueArgs { uint32_t n, n_tok, n_embd, topk; };
+struct LatArgs { uint32_t ell, rows, g, maxt, n_tok, pad0, pad1, pad2; };   // latent.metal
+constexpr int LAT_MAXG = P_MAXE / MAXT;   // latent groups: the combine's plan holds one entry a (token, group), P_MAXE in all
 struct ArgArgs { uint32_t n_vocab, parts; };
 // the routed gate/up's i-quant grids from constant memory (QUANT_CTAB, function constant 23 of quant.metal): bitwise
 // the threadgroup copy's values, 3-7% faster on the M5 Max; STRATA_METAL_CTAB=0 turns it off
@@ -166,6 +169,7 @@ public:
     int64_t vocab() const { return n_vocab_; }
     bool ready() const { return cx_ != nullptr; }
     bool streaming() const { return stream_; }
+    bool latent() const { return lat_; }   // an Edge0 latent pack: the prompt goes through decode windows
     // --serve's conversation checkpoints: the window's running state (the GDN recurrences and conv histories, the
     // PLE history, each QSA layer's indexer tail and tail-block key); the KV and pooled keys are positional
     bool checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& err);
@@ -286,6 +290,17 @@ private:
         ysh_, sg_, qfull_, kcur_, vcur_, iqr_, ikr_, qcur_, qidx_, scores_, qids_, part_, cs_, lm_, apv_, api_, tokout_,
         emb_, pkey_, pval_, qkvL_, alL_, beL_, zL_, ydump_, keyn_, qn_, gated_, normW_, pleHist_;
     Act XA_, XF_, XY_, XQ_, XH_, XE_;
+    // ---- the latent MoE (Edge0 120B / 145B: STRATA_LATENT_A / _DENSE / _LABELS, kernels/latent.metal).  The experts' pack
+    // and the D/U pack are mmapped and wrapped no-copy like the GGUF; a layer's experts are bound at its first blob.
+    bool lat_ = false;
+    int lat_G_ = 0, lat_ELL_ = 0, lat_I_ = 0, lat_fmt_ = 8;
+    size_t lat_blob_ = 0;
+    void *lat_a_map_ = nullptr, *lat_d_map_ = nullptr;
+    mtl::Buffer LA_, LD_, lab_, linv_, lxl_, lz_, lyu_, uplan_, LXb_, LZb_;
+    bool latent_init(std::string& err);
+    void latent_moe(std::vector<mtl::Dispatch>& ds, int l, int ntok, const std::string& b);
+    void lat_gemv(std::vector<mtl::Dispatch>& ds, size_t w_off, int n_in, int n_out, const mtl::Buffer& xp, size_t plane,
+                  size_t row0, const mtl::Buffer& y, size_t y_off, size_t y_stride, int ntok);
     int cur_inj_ = 0;
     // state
     std::vector<mtl::Buffer> gst_, ghist_[2], kq_, vq_, ksc_, vsc_, tail_, dead_, pooled_;
@@ -579,7 +594,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     n_vocab_ = (int64_t) T("output.weight").shape[1];
     if (const gguf::Tensor* e0 = f_.find("blk.0.ffn_gate_exps.weight")) gyro_dense_ = e0->type >= 144;
     lib_ = cx_->compile({"quant.metal", "units.metal", "moe.metal", "gemv.metal", "router.metal", "gr.metal", "gr2.metal",
-                         "glue.metal"});
+                         "glue.metal", "latent.metal"});
     rcounter_ = cx_->alloc(16);
     lgdn_ = cx_->compile({"gdn.metal"}, "#define NO_GGML_COMMON 1\n");
     lqsa_ = cx_->compile({"qsa.metal", "qsa2.metal"}, "#define NO_GGML_COMMON 1\n");
@@ -621,6 +636,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     rinfo_ = A(4 * (8 + 4 * MAXT));
     auto act = [&](int n) { Act a; a.n = n; a.b = A(4 * ((size_t) 4 * MAXT * n + (size_t) MAXT * n / 16)); return a; };
     XA_ = act(N); XF_ = act(N); XY_ = act(6144); XQ_ = act(6144); XH_ = act(NFF); XE_ = act(N);
+    if (!latent_init(err)) return false;
     {   // Gyro (native_experts.txt v5 + hadamard.txt): the rotation's signs and the rotated gate/up input
         const auto& hs = strata::kernels::cpu::hadamard_spec();
         had_on_ = hs.any();
@@ -1014,7 +1030,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
     // ---- the MoE
     gr_read(ds, b + "hc_ffn", true, XF_, false, ntok);
     const gguf::Tensor& trt = T(b + "ffn_gate_inp.weight");
-    const bool rf = routef_ && (trt.type == ref::BF16 || trt.type == ref::F32);
+    const bool rf = routef_ && !lat_ && (trt.type == ref::BF16 || trt.type == ref::F32);
     if (!rf) {
         gemv(ds, trt, XF_, logits_, 512, ntok);
         nb_ = true;
@@ -1035,6 +1051,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
     gemv(ds, T(b + "ffn_up_shexp.weight"), XF_, ush_, NFF, ntok);
     nb_ = true;
     gemv(ds, T(b + "ffn_gate_inp_shexp.weight"), XF_, sg_, 1, ntok);
+    if (lat_) { latent_moe(ds, l, ntok, b); return; }
     {
         MoeArgs a{};
         const gguf::Tensor &tg_ = T(b + "ffn_gate_exps.weight"), &tu = T(b + "ffn_up_exps.weight"),
@@ -1140,6 +1157,275 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         mtl::Dispatch d;
         d.p = P(lib_, "moe_combine_sh", {}, "moe_combine_sh");
         d.args = {mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::B(ysh_), mtl::Arg::B(sg_), mtl::Arg::B(bo_), mtl::Arg::V(a)};
+        d.grid[0] = (ntok * N + 255) / 256;
+        d.tg[0] = 256;
+        push(ds, d);
+    }
+}
+
+// ---- the latent MoE (Edge0 120B / 145B) -----------------------------------------------------------------------------
+namespace {
+void* map_whole(const std::string& path, size_t& bytes, std::string& err) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) { err = "metal latent: cannot open " + path; return nullptr; }
+    const off_t n = lseek(fd, 0, SEEK_END);
+    void* m = n > 0 ? mmap(nullptr, (size_t) n, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
+    ::close(fd);
+    if (m == MAP_FAILED) { err = "metal latent: cannot map " + path; return nullptr; }
+    bytes = (size_t) n;
+    return m;
+}
+}  // namespace
+
+// Reads the experts' pack and the D/U pack through once, in order, on a thread of its own, so their pages are in the
+// file cache before a prompt needs them: a prompt window of 8 tokens reads up to 80 experts a layer (6 GB over the 48
+// layers), and a page fault at a time from the GPU that is about 0.4 GB/s where a sequential read is several GB/s.
+// Only when the memory has room for both files beside what is in use (free + inactive + speculative + purgeable pages,
+// 4 GiB kept back): on a Mac that is short the read would push other programs into swap, and the pages would not stay.
+// STRATA_METAL_LATENT_WARM=0 never reads ahead, =1 always does.
+static void latent_warm(const std::string& a_path, size_t a_bytes, const std::string& d_path, size_t d_bytes) {
+    const char* e = std::getenv("STRATA_METAL_LATENT_WARM");
+    if (e && std::string(e) == "0") return;
+    if (!(e && std::string(e) == "1")) {
+        vm_statistics64_data_t vs{};
+        mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+        vm_size_t page = 16384;
+        host_page_size(mach_host_self(), &page);
+        if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &cnt) != KERN_SUCCESS) return;
+        const uint64_t room = ((uint64_t) vs.free_count + vs.inactive_count + vs.speculative_count + vs.purgeable_count) * page;
+        if (room < (uint64_t) a_bytes + d_bytes + (4ull << 30)) {
+            std::fprintf(stderr, "strata metal: latent packs not read ahead: %.1f GB of memory is free or reclaimable and they are %.1f GB; "
+                         "prompts will read the experts from the SSD as they route to them (slow). Close other programs, or "
+                         "STRATA_METAL_LATENT_WARM=1 reads ahead anyway\n", room / 1e9, (a_bytes + d_bytes) / 1e9);
+            return;
+        }
+    }
+    std::thread([a_path, d_path] {
+        const double t0 = now_ms();
+        std::vector<char> buf((size_t) 16 << 20);
+        uint64_t total = 0;
+        for (const std::string& p : {d_path, a_path}) {
+            const int fd = ::open(p.c_str(), O_RDONLY);
+            if (fd < 0) continue;
+            for (ssize_t n; (n = ::read(fd, buf.data(), buf.size())) > 0;) total += (uint64_t) n;
+            ::close(fd);
+        }
+        std::fprintf(stderr, "strata metal: latent packs read ahead: %.1f GB in %.1f s\n", total / 1e9, (now_ms() - t0) / 1e3);
+    }).detach();
+}
+
+// The pack's three files (the CUDA engine's names): STRATA_LATENT_A = experts.bin, 48 x 512 blobs [gate | up | down];
+// STRATA_LATENT_DENSE = a layer's D [G * ELL, N] then U [G * N, ELL] rows; STRATA_LATENT_LABELS = 48 x 512 group labels.
+// The geometry comes from the file sizes and the labels, and is checked against the one pack this window has kernels
+// for: Q3_K gate/up and IQ4_NL down.
+bool Window::latent_init(std::string& err) {
+    const char *ea = std::getenv("STRATA_LATENT_A"), *ed = std::getenv("STRATA_LATENT_DENSE"),
+               *el = std::getenv("STRATA_LATENT_LABELS");
+    if (!ea || !*ea || !ed || !*ed) return true;   // not a latent pack
+    if (!el || !*el) { err = "metal latent: STRATA_LATENT_LABELS is not set"; return false; }
+    if (const char* f = std::getenv("STRATA_LATENT_DENSE_FMT")) lat_fmt_ = std::atoi(f) == 4 ? 4 : 8;
+    const size_t page = 16384, rb = lat_fmt_ == 4 ? 18 : 34;
+    size_t a_bytes = 0, d_bytes = 0;
+    lat_a_map_ = map_whole(ea, a_bytes, err);
+    if (!lat_a_map_) return false;
+    lat_d_map_ = map_whole(ed, d_bytes, err);
+    if (!lat_d_map_) return false;
+    std::vector<int32_t> lab((size_t) 48 * NEXP);
+    {
+        std::FILE* f = std::fopen(el, "rb");
+        const size_t got = f ? std::fread(lab.data(), 4, lab.size(), f) : 0;
+        if (f) std::fclose(f);
+        if (got != lab.size()) { err = std::string("metal latent: ") + el + " does not hold 48 x 512 labels"; return false; }
+    }
+    int G = 0;
+    for (int32_t v : lab) {
+        if (v < 0 || v >= LAT_MAXG) { err = "metal latent: a group label is outside 0.." + std::to_string(LAT_MAXG - 1); return false; }
+        G = std::max(G, v + 1);
+    }
+    // a layer of the dense pack: G * ELL rows of N / 32 blocks, then G * N rows of ELL / 32 blocks = 2 * G * ELL * N / 32 * rb
+    const size_t per_layer = d_bytes / 48, gell = per_layer / (2 * (size_t) (N / 32) * rb);
+    const int ELL = (int) (gell / (size_t) G);
+    if (d_bytes % 48 || per_layer % page || (size_t) ELL * G != gell || ELL % 256 || ELL <= 0 || ELL > N ||
+        2 * (size_t) G * ELL * (N / 32) * rb != per_layer) {
+        err = std::string("metal latent: ") + ed + " is not 48 layers of D/U rows in the format STRATA_LATENT_DENSE_FMT names";
+        return false;
+    }
+    const int I = NFF;
+    const size_t blob = 2 * (size_t) I * ref::row_bytes(ref::Q3_K, ELL) + (size_t) ELL * ref::row_bytes(ref::IQ4_NL, I);
+    if (a_bytes != (size_t) 48 * NEXP * blob || ((size_t) NEXP * blob) % page) {
+        err = std::string("metal latent: ") + ea + " is not 48 x 512 blobs of Q3_K gate/up and IQ4_NL down at the latent width " +
+              std::to_string(ELL) + " (the only latent pack the Metal engine reads)";
+        return false;
+    }
+    lat_G_ = G; lat_ELL_ = ELL; lat_I_ = I; lat_blob_ = blob;
+    latent_warm(ea, a_bytes, ed, d_bytes);
+    LA_ = cx_->wrap(lat_a_map_, a_bytes, (size_t) NEXP * blob);
+    LD_ = cx_->wrap(lat_d_map_, d_bytes, per_layer);
+    if (LA_.handle == nullptr || LD_.handle == nullptr) { err = "metal latent: cannot wrap the latent packs as Metal buffers"; return false; }
+    auto A = [&](size_t bytes) { return cx_->alloc(bytes); };
+    const size_t R = (size_t) MAXT * G;   // the xl rows of a full window, and z's rows
+    lab_ = A(4 * lab.size());
+    std::memcpy(lab_.ptr, lab.data(), 4 * lab.size());
+    linv_ = A(4 * (size_t) 48 * ELL);
+    {   // the shared column scale s (scales/l<l>.f32 beside the pack): the gate/up rows hold A * diag(s), so xl is multiplied by 1 / s
+        const std::string dir = std::filesystem::path(ea).parent_path().string();
+        float* inv = linv_.as<float>();
+        for (size_t i = 0; i < (size_t) 48 * ELL; ++i) inv[i] = 1.0f;
+        int have = 0;
+        std::vector<float> sc((size_t) ELL);
+        for (int l = 0; l < 48; ++l) {
+            std::FILE* f = std::fopen(((dir.empty() ? "." : dir) + "/scales/l" + std::to_string(l) + ".f32").c_str(), "rb");
+            if (!f) continue;
+            const size_t got = std::fread(sc.data(), 4, sc.size(), f);
+            std::fclose(f);
+            if (got != sc.size()) { err = "metal latent: scales/l" + std::to_string(l) + ".f32 is short"; return false; }
+            for (int c = 0; c < ELL; ++c) inv[(size_t) l * ELL + c] = sc[(size_t) c] > 0.0f ? 1.0f / sc[(size_t) c] : 1.0f;
+            ++have;
+        }
+        if (have != 0 && have != 48) { err = "metal latent: the pack has column scales for " + std::to_string(have) + " of 48 layers"; return false; }
+    }
+    lxl_ = A(4 * R * ELL);
+    lz_ = A(4 * R * ELL);
+    lyu_ = A(4 * R * N);
+    LXb_ = A(4 * (4 * R * ELL + R * ELL / 16));
+    LZb_ = A(4 * (4 * R * ELL + R * ELL / 16));
+    uplan_ = A(4 * P_INTS);   // moe_combine_sh's entry of (token, k): here k is the group, its row in lyu_ is g * MAXT + t
+    for (int t = 0; t < MAXT; ++t)
+        for (int g = 0; g < G; ++g) uplan_.as<int32_t>()[P_TOKENT + t * G + g] = g * MAXT + t;
+    lat_ = true;
+    std::fprintf(stderr, "strata metal: latent MoE (%d groups, latent width %d, expert width %d, D/U Q%d_0): %.1f GB of experts, "
+                 "%.1f GB of D/U wrapped; prompts go through decode windows\n", G, ELL, I, lat_fmt_, a_bytes / 1e9, d_bytes / 1e9);
+    return true;
+}
+
+// gemv() for the D/U pack: `xp` is a prepared activation buffer of `plane` bytes a kind, read from row `row0` on
+void Window::lat_gemv(std::vector<mtl::Dispatch>& ds, size_t w_off, int n_in, int n_out, const mtl::Buffer& xp, size_t plane,
+                      size_t row0, const mtl::Buffer& y, size_t y_off, size_t y_stride, int ntok) {
+    const int ty = lat_fmt_ == 4 ? ref::Q4_0 : ref::Q8_0;
+    const int L = 16, Rr = 1, S = 4, K = 1;
+    const std::string fn = "gemv_" + std::to_string(ty) + "_" + std::to_string(L) + "_" + std::to_string(Rr) + "_" +
+                           std::to_string(S) + "_" + std::to_string(K);
+    GemvArgs a{(uint32_t) n_in, (uint32_t) n_out, (uint32_t) ntok, (uint32_t) ref::row_bytes(ty, n_in), (uint32_t) n_in,
+               (uint32_t) y_stride};
+    mtl::Dispatch d;
+    d.p = P(lib_, fn, mtl::Constants().i(0, ntok), fn + "#" + std::to_string(ntok));
+    d.args = {mtl::Arg::B(LD_, w_off), mtl::Arg::B(xp, plane * xkind(ty) + row0 * (size_t) n_in * 4),
+              mtl::Arg::B(xp, plane * 4 + row0 * (size_t) (n_in / 16) * 4), mtl::Arg::B(y, y_off), mtl::Arg::V(a)};
+    const int rpt = (S / K) * (32 / L) * Rr;
+    d.grid[0] = (n_out + rpt - 1) / rpt;
+    d.tg[0] = S * 32;
+    push(ds, d);
+}
+
+// The routed experts of a latent layer (the caller has queued the router and the shared expert's gate, up and gate scalar).
+void Window::latent_moe(std::vector<mtl::Dispatch>& ds, int l, int ntok, const std::string& b) {
+    const int G = lat_G_, ELL = lat_ELL_, I = lat_I_;
+    const size_t R = (size_t) MAXT * G, plane = 4 * R * ELL;
+    const size_t rb = lat_fmt_ == 4 ? 18 : 34;
+    const size_t dby = (size_t) G * ELL * (N / 32) * rb, urow = (size_t) (ELL / 32) * rb, lbase = (size_t) l * 2 * dby;
+    const LatArgs la{(uint32_t) ELL, (uint32_t) (ntok * G), (uint32_t) G, (uint32_t) MAXT, (uint32_t) ntok, 0, 0, 0};
+    auto xprep_rows = [&](const mtl::Buffer& x, const mtl::Buffer& out) {   // xprep over R rows of ELL
+        mtl::Dispatch d;
+        d.p = P(lib_, "xprep", {}, "xprep");
+        const uint32_t nn = ELL, nt = (uint32_t) R;
+        d.args = {mtl::Arg::B(x), mtl::Arg::B(out), mtl::Arg::V(nn), mtl::Arg::V(nt)};
+        d.tg[0] = 256;
+        d.grid[0] = (uint32_t) ((ELL / 16 * R + 255) / 256);
+        push(ds, d);
+    };
+    // D: xl[t][g] = D_g . x[t], scaled by the pack's 1 / s, prepared for the experts
+    lat_gemv(ds, lbase, N, G * ELL, XF_.b, XF_.plane_bytes(), 0, lxl_, 0, (size_t) G * ELL, ntok);
+    {
+        mtl::Dispatch d;
+        d.p = P(lib_, "lat_colscale", {}, "lat_colscale");
+        d.args = {mtl::Arg::B(lxl_), mtl::Arg::B(linv_, (size_t) l * ELL * 4), mtl::Arg::V(la)};
+        d.tg[0] = 256;
+        d.grid[0] = (uint32_t) ((ntok * G * ELL + 255) / 256);
+        push(ds, d);
+    }
+    xprep_rows(lxl_, LXb_);
+    // the route and its plan; the plan's rows then name each entry's xl row
+    MoeArgs a{};
+    a.gu_row = (uint32_t) ref::row_bytes(ref::Q3_K, ELL);
+    a.d_row = (uint32_t) ref::row_bytes(ref::IQ4_NL, I);
+    a.gate_off = 0;
+    a.up_off = (uint64_t) I * a.gu_row;
+    a.down_off = 2 * a.up_off;
+    a.gu_stride = a.d_stride = lat_blob_;
+    a.n_embd = ELL; a.n_ff = I; a.n_tok = ntok; a.topk = TOPK; a.n_expert = NEXP;
+    const int gl = 32, gr = 1, gs = 4, ds_ = 4, dl = 4, dr = 2;
+    a.gx_gu = I / (gs * (32 / gl) * gr);
+    a.gx_dn = ELL / (ds_ * (32 / dl) * dr);
+    {
+        mtl::Dispatch r;
+        r.p = P(lib_, "moe_route", {}, "moe_route");
+        r.args = {mtl::Arg::B(logits_), mtl::Arg::B(ids_), mtl::Arg::B(wts_), mtl::Arg::B(plan_), mtl::Arg::V(a)};
+        r.tg[0] = 512;
+        push(ds, r);
+        mtl::Dispatch pr;
+        pr.p = P(lib_, "lat_plan_rows", {}, "lat_plan_rows");
+        pr.args = {mtl::Arg::B(plan_), mtl::Arg::B(lab_, (size_t) l * NEXP * 4), mtl::Arg::V(la)};
+        pr.tg[0] = P_MAXE;
+        push(ds, pr);
+    }
+    {
+        GlueArgs ga{NFF, MAXT, N, TOPK};
+        mtl::Dispatch d;
+        d.p = P(lib_, "swiglu_prep", {}, "swiglu_prep");
+        d.args = {mtl::Arg::B(gsh_), mtl::Arg::B(ush_), mtl::Arg::B(XH_.b), mtl::Arg::V(ga)};
+        d.grid[0] = NFF / 16;
+        d.grid[1] = ntok;
+        d.tg[0] = 16;
+        push(ds, d);
+    }
+    const size_t ebase = (size_t) l * NEXP * lat_blob_;
+    const bool ct = metal_ctab();
+    mtl::Constants ac;
+    ac.b(23, ct);
+    {   // A: gate + up + SwiGLU at the latent width, each entry on its group's xl row
+        const std::string gun = "moe_gu_" + std::to_string((int) ref::Q3_K) + "_" + std::to_string(gl) + "_" + std::to_string(gr) +
+                                "_" + std::to_string(gs);
+        mtl::Dispatch g;
+        g.p = P(lib_, gun, ac, gun + (ct ? "#ct" : ""));
+        g.args = {mtl::Arg::B(LA_, ebase), mtl::Arg::B(LXb_, plane * xkind(ref::Q3_K)), mtl::Arg::B(h_), mtl::Arg::B(plan_),
+                  mtl::Arg::V(a), mtl::Arg::B(LXb_, plane * 4)};
+        g.tg[0] = 32 * gs;
+        g.indirect = &plan_;
+        g.ind_off = P_IGU * 4;
+        push(ds, g);
+    }
+    nb_ = true;
+    gemv(ds, T(b + "ffn_down_shexp.weight"), XH_, ysh_, N, ntok);
+    {   // A: down, ye[entry] = weight * yl
+        const std::string dnn = "moe_down_" + std::to_string((int) ref::IQ4_NL) + "_" + std::to_string(dl) + "_" +
+                                std::to_string(dr) + "_" + std::to_string(ds_);
+        mtl::Dispatch dd;
+        dd.p = P(lib_, dnn, ac, dnn + (ct ? "#ct" : ""));
+        dd.args = {mtl::Arg::B(LA_, ebase), mtl::Arg::B(h_), mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(h_)};
+        dd.tg[0] = 32 * ds_;
+        dd.indirect = &plan_;
+        dd.ind_off = P_IDN * 4;
+        push(ds, dd);
+    }
+    {   // z[g][t]: the weighted outputs summed by group, then U a group
+        mtl::Dispatch d;
+        d.p = P(lib_, "lat_group_sum", {}, "lat_group_sum");
+        d.args = {mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::B(lz_), mtl::Arg::V(la)};
+        d.tg[0] = 256;
+        d.grid[0] = (uint32_t) ((R * ELL + 255) / 256);
+        push(ds, d);
+    }
+    xprep_rows(lz_, LZb_);
+    for (int g = 0; g < G; ++g) {
+        if (g) nb_ = true;   // the groups' GEMVs write disjoint rows
+        lat_gemv(ds, lbase + dby + (size_t) g * N * urow, ELL, N, LZb_, plane, (size_t) g * MAXT, lyu_,
+                 (size_t) g * MAXT * N * 4, N, ntok);
+    }
+    {
+        GlueArgs ca{N, (uint32_t) ntok, N, (uint32_t) G};
+        mtl::Dispatch d;
+        d.p = P(lib_, "moe_combine_sh", {}, "moe_combine_sh");
+        d.args = {mtl::Arg::B(lyu_), mtl::Arg::B(uplan_), mtl::Arg::B(ysh_), mtl::Arg::B(sg_), mtl::Arg::B(bo_), mtl::Arg::V(ca)};
         d.grid[0] = (ntok * N + 255) / 256;
         d.tg[0] = 256;
         push(ds, d);
@@ -3045,7 +3331,8 @@ bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* con
 bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
                      const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
     if (g_window == nullptr) { err = "metal prompt: the decode window is not up yet"; return false; }
-    static const bool windows = std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window";
+    static const bool windows = g_window->latent() ||
+                                (std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window");
     static const int64_t min_rows = std::getenv("STRATA_METAL_PROMPT_MIN") ? std::atoll(std::getenv("STRATA_METAL_PROMPT_MIN")) : 32;
     if (!windows && !g_window->streaming() && n >= min_rows) return g_window->prompt(tokens, n, pos0, on_chunk, err);
     if (!windows && g_window->streaming()) {

@@ -103,7 +103,8 @@ set(STRATA_METAL_HOST_SOURCES
   ${S}/prefill/prefill.cpp
   ${S}/spec/suffix_drafter.cpp ${S}/spec/controller.cpp ${S}/spec/draft_policy.cpp ${S}/spec/draft_source.cpp
   ${S}/kernels/cpu/pool.cpp ${S}/kernels/cpu/expert_layout.cpp ${S}/kernels/cpu/native_expert.cpp
-  ${S}/kernels/cpu/hadamard.cpp ${S}/kernels/cpu/tq_cpu.cpp)   # Gyro: the Hadamard rotation, the scalar trellis rows
+  ${S}/kernels/cpu/hadamard.cpp ${S}/kernels/cpu/tq_cpu.cpp   # Gyro: the Hadamard rotation, the scalar trellis rows
+  ${S}/core/latent_dense.cpp ${S}/latent/latent_moe.cpp ${S}/kernels/cpu/kq_scalar.cpp)   # Edge0 latent MoE: the D/U pack, the layer module, the CPU share's scalar rows
 set_source_files_properties(${S}/core/device.cu ${S}/core/pinned.cu ${DS4}/ds4_vision.cu ${DS4}/vendor/exl3.cu ${DS4}/vendor/moe_win.cu ${DS4}/vendor/sampler.cu
                             PROPERTIES LANGUAGE CXX)
 

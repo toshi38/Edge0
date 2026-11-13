@@ -22,6 +22,7 @@ bool is_iq(int t) {
 int gu_qk(int t) {
     switch (t) {
         case 16: case 17: case 18: case 21: case 22: case 23: case 29: case 12: case 13: case 14: return 256;
+        case 11: return 256;   // Q3_K gate/up: Edge0's latent experts (moe_gu_11, metal/kernels/moe.metal)
         case 42: return 64;
         case 144: case 145: return 128;   // TQ2_T / TQK6 gate/up (the CUDA engine's STRATA_GU_FMTS)
         case 6: case 2: case 3: case 8: return 32;
