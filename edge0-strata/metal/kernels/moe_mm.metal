@@ -388,7 +388,7 @@ kernel void mm_down2(device const uchar* W [[buffer(0)]], device const half* HS 
     MMDN2(F, 16, 128, 32, 4) MMDN2(F, 32, 64, 32, 2) MMDN2(F, 64, 64, 32, 4)
 // K-quants: the staged K chunk must hold whole units as DW places them (128 wide): TK 128
 #define MM_GU2_KQ(F) MMGU2(F, 16, 32, 128, 2) MMGU2(F, 16, 16, 128, 2) MMGU2(F, 32, 32, 128, 2) MMGU2(F, 16, 32, 128, 4)
-MM_GU2_KQ(T_Q4_K) MM_GU2_KQ(T_Q5_K) MM_GU2_KQ(T_Q6_K) MM_GU2_U32(T_Q8_0) MM_DN2_U32(T_Q5_1) MM_DN2_U32(T_Q8_0)
+MM_GU2_KQ(T_Q3_K) MM_GU2_KQ(T_Q4_K) MM_GU2_KQ(T_Q5_K) MM_GU2_KQ(T_Q6_K) MM_GU2_U32(T_Q8_0) MM_DN2_U32(T_Q5_1) MM_DN2_U32(T_Q8_0)
 // IQ4_XS (UNIT 32): the K chunk must be >= 32
 MMGU2(T_IQ4_XS, 16, 64, 32, 2) MMGU2(T_IQ4_XS, 16, 64, 64, 2) MMGU2(T_IQ4_XS, 32, 64, 32, 2) MMGU2(T_IQ4_XS, 16, 32, 32, 2)
 MMGU2(T_IQ4_XS, 64, 64, 32, 4)
@@ -397,6 +397,9 @@ MM_GU2_SET(T_TQK6) MM_GU2_SET(T_TQ2T)   // Gyro: the trellis gate/up (units of 1
 MM_DN2_SET(T_Q2_0)
 MM_DN2_SET(T_TQK7) MM_DN2_SET(T_TQ2T)
 MMDN2(T_IQ4_NL, 16, 64, 32, 2) MMDN2(T_IQ4_NL, 16, 64, 64, 2) MMDN2(T_IQ4_NL, 16, 32, 32, 2) MMDN2(T_IQ4_NL, 32, 32, 32, 2) MMDN2(T_IQ4_NL, 16, 128, 32, 4)
+// a latent pack's experts (Q3_K gate/up, IQ4_NL down at the latent width): taller tiles, for chunks where an expert has many rows
+MMGU2(T_Q3_K, 32, 32, 128, 4) MMGU2(T_Q3_K, 64, 32, 128, 4) MMGU2(T_Q3_K, 64, 32, 128, 2)
+MMDN2(T_IQ4_NL, 32, 64, 32, 2) MMDN2(T_IQ4_NL, 32, 64, 32, 4) MMDN2(T_IQ4_NL, 64, 64, 32, 4) MMDN2(T_IQ4_NL, 64, 32, 32, 2)
 
 // ---- v3: the weights decoded straight into matmul2d's right-input cooperative tensor (single-simdgroup scope),
 // no threadgroup staging and no barriers in the K loop.  Each simdgroup owns TN output rows; a threadgroup SG * TN.

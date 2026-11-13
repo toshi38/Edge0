@@ -143,12 +143,16 @@ struct PromptBufs {
     bool v3e = false;
     bool fused = false;          // the GDN input projections as one GEMM (gdn_fused_inputs)            // the M5's expert kernels (v3): not for the trellis types, which have only v2
     int C = 0, maxrows = 0;
+    int tm = 16;                 // rows a tile of the expert GEMMs
     double gpu_ms = 0, host_ms = 0, mtp_ms = 0;
     int gu3[4] = {}, dn3[4] = {};
     mtl::Buffer R, bo, inj[2], xn, xnh, V, loh, mixed, mixh, qkv, z, al, be, yg, ygh, gqn, gkn, gvc, ggb, gkq, go, qfull,
         kcur, vcur, iqr, ikr, qcur, qcurh, qidx, scores, qids, part, XQ, xqh, logits, ids, wts, bcnt, boff, eoff, tiles, meta,
         stok, sw, pos, XS, HS, YE, yr, gsh, ush, hh, ys, sgv, WD, WU, Wqkv, Wz, Wal, Wbe, Wout, Wq, Wk, Wv, Wiq, Wik, Wr,
         Wsg, Wshg, Wshu, Wshd, yf, Wcat, pemb, pembh, pkey, pval, keyn, qn, gated, normW, Wpk, Wpv, mixr;
+    // a latent pack's chunk: D rows as fp16, xl [C][G][ELL], each padded row's xl row, z as fp16 [G][C][ELL], a group's
+    // U rows as fp16, the groups' outputs [G][C][N]
+    mtl::Buffer LWD, LXL, lrow, LZH, LWU, LYU;
 };
 
 // The vision path (--vision, GENI requests), from the shared host code: the image rows of the prompt being read
@@ -169,7 +173,7 @@ public:
     int64_t vocab() const { return n_vocab_; }
     bool ready() const { return cx_ != nullptr; }
     bool streaming() const { return stream_; }
-    bool latent() const { return lat_; }   // an Edge0 latent pack: the prompt goes through decode windows
+    bool latent() const { return lat_; }   // an Edge0 latent pack
     // --serve's conversation checkpoints: the window's running state (the GDN recurrences and conv histories, the
     // PLE history, each QSA layer's indexer tail and tail-block key); the KV and pooled keys are positional
     bool checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& err);
@@ -3331,8 +3335,9 @@ bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* con
 bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
                      const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
     if (g_window == nullptr) { err = "metal prompt: the decode window is not up yet"; return false; }
-    static const bool windows = g_window->latent() ||
-                                (std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window");
+    // a latent pack reads its prompt through decode windows unless STRATA_METAL_PROMPT=chunk asks for the prompt chain
+    static const std::string mode = std::getenv("STRATA_METAL_PROMPT") ? std::getenv("STRATA_METAL_PROMPT") : "";
+    static const bool windows = mode == "window" || (g_window->latent() && mode != "chunk");
     static const int64_t min_rows = std::getenv("STRATA_METAL_PROMPT_MIN") ? std::atoll(std::getenv("STRATA_METAL_PROMPT_MIN")) : 32;
     if (!windows && !g_window->streaming() && n >= min_rows) return g_window->prompt(tokens, n, pos0, on_chunk, err);
     if (!windows && g_window->streaming()) {

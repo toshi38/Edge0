@@ -12,6 +12,12 @@
 
 namespace {
 constexpr int PC_QB = 2051, PC_QCHUNKS = 33, PC_TM = 16;
+// a latent pack's expert tiles (latent_chunk_parity's sweep on an M4 Max, 2048 rows: 18.5 ms a layer against 26.1 for
+// 16_32_128_2 / 16_64_32_2)
+constexpr int PC_LAT_TM = 32;
+constexpr const char *PC_LAT_GU = "_32_32_128_4", *PC_LAT_DN = "_32_64_32_2";
+constexpr int PC_LAT_GU_TN = 32, PC_LAT_GU_SG = 4, PC_LAT_DN_TN = 64, PC_LAT_DN_SG = 2;
+struct PcLatArgs { uint32_t g, tm, ell, n_tok, topk, n_out, pad0, pad1; };
 struct PcDqArgs { uint32_t n_in, n_out, row_bytes, perm; };
 struct PcGemmArgs { int M, N, K, pad; };
 struct PcEpiArgs { uint32_t n_tok, n_embd, hc, hc_lr; };
@@ -52,17 +58,19 @@ bool Window::pc_setup(int C) {
     const double t0 = now_ms();
     if (b.C == 0) {
         b.lib = cx_->compile({"quant.metal", "units.metal", "mma.metal", "dense_mm.metal", "moe_mm.metal", "gr.metal",
-                              "gemv.metal", "prompt.metal"});
+                              "gemv.metal", "prompt.metal", "latent_mm.metal"});
         b.lgdn = cx_->compile({"gdn.metal", "gdn_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
         b.lqsa = cx_->compile({"qsa.metal", "qsa_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
         b.k4 = coop_k4();
     }
     b = PromptBufs{b.lib, b.lgdn, b.lqsa, b.k4};   // (re)allocated below for the larger chunk
-    b.v3e = b.k4 && T("blk.0.ffn_gate_exps.weight").type < 144;   // the trellis experts have the v2 kernels only
+    // the trellis experts have the v2 kernels only, and so has a latent pack
+    b.v3e = b.k4 && !lat_ && T("blk.0.ffn_gate_exps.weight").type < 144;
     b.C = C;
     const size_t MT = (size_t) C;
     const int MB = (int) max_cells_ / 4 + 2;
-    b.maxrows = (int) MT * TOPK + NEXP * PC_TM;
+    b.tm = lat_ ? PC_LAT_TM : PC_TM;
+    b.maxrows = (int) MT * TOPK + NEXP * b.tm;
     const int nblk_max = ((int) MT * TOPK + 1023) / 1024;
     auto F32 = [&](size_t n) { return cx_->alloc(4 * n); };
     auto F16 = [&](size_t n) { return cx_->alloc(2 * n); };
@@ -110,6 +118,13 @@ bool Window::pc_setup(int C) {
     b.dn3[0] = 16; b.dn3[1] = 64; b.dn3[2] = 32; b.dn3[3] = 2;
     b.meta.as<uint32_t>()[2] = b.v3e ? NFF / (b.gu3[1] * b.gu3[3]) : NFF / 64;
     b.meta.as<uint32_t>()[5] = b.v3e ? N / (b.dn3[1] * b.dn3[3]) : N / 64;
+    if (lat_) {
+        const size_t G = (size_t) lat_G_, ELL = (size_t) lat_ELL_;
+        b.LWD = F16(G * ELL * N); b.LXL = F32(MT * G * ELL); b.lrow = cx_->alloc(4 * (size_t) b.maxrows);
+        b.LZH = F16(G * MT * ELL); b.LWU = F16((size_t) N * ELL); b.LYU = F32(G * MT * N);
+        b.meta.as<uint32_t>()[2] = (uint32_t) (lat_I_ / PC_LAT_GU_TN);   // the gate/up GEMM's grid: the expert width in tiles
+        b.meta.as<uint32_t>()[5] = (uint32_t) (lat_ELL_ / PC_LAT_DN_TN);   // the down GEMM's: the latent width
+    }
     std::fprintf(stderr, "strata metal: prompt kernels (mac-kern's prompt chain) for chunks of %d rows, %s, ready in %.0f ms\n",
                  C, b.k4 ? "matrix-unit register operands (COOP_K4)" : "the older expert / attention kernels (no M5 layout)",
                  now_ms() - t0);
@@ -303,7 +318,6 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         }
         // ---- MoE
         hc_read(bl + "hc_ffn", true);
-        const gguf::Tensor &eg = T(bl + "ffn_gate_exps.weight"), &eu = T(bl + "ffn_up_exps.weight"), &ed = T(bl + "ffn_down_exps.weight");
         dq(T(bl + "ffn_gate_inp.weight"), b.Wr);
         dq(T(bl + "ffn_gate_inp_shexp.weight"), b.Wsg);
         dq(T(bl + "ffn_gate_shexp.weight"), b.Wshg);
@@ -313,7 +327,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         const uint32_t nt = (uint32_t) nT;
         D(P_(b.lib, "route_topk"), {mtl::Arg::B(b.logits), mtl::Arg::B(b.ids), mtl::Arg::B(b.wts), mtl::Arg::V(nt)}, (nT + 7) / 8, 1, 256);
         const int nent = nT * TOPK, nblk = (nent + 1023) / 1024;
-        PcMmPlanArgs pa{(uint32_t) nent, TOPK, NEXP, (uint32_t) PC_TM, (uint32_t) nblk};
+        PcMmPlanArgs pa{(uint32_t) nent, TOPK, NEXP, (uint32_t) b.tm, (uint32_t) nblk};
         const uint32_t nclr = (uint32_t) b.maxrows;
         D(P_(b.lib, "mm_clear"), {mtl::Arg::B(b.stok), mtl::Arg::V(nclr)}, (b.maxrows + 255) / 256, 1, 256);
         D(P_(b.lib, "mm_hist"), {mtl::Arg::B(b.ids), mtl::Arg::B(b.bcnt), mtl::Arg::V(pa)}, nblk, 1, 1024);
@@ -321,51 +335,111 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
                                 mtl::Arg::V(pa)}, 1, 1, NEXP);
         D(P_(b.lib, "mm_place"), {mtl::Arg::B(b.ids), mtl::Arg::B(b.wts), mtl::Arg::B(b.boff), mtl::Arg::B(b.eoff), mtl::Arg::B(b.stok),
                                  mtl::Arg::B(b.sw), mtl::Arg::B(b.pos), mtl::Arg::V(pa)}, nblk, 1, 1024);
-        PcMmArgs ma{eg.offset, eu.offset, ed.offset, 0, 0, (uint32_t) ref::row_bytes(eg.type, N), (uint32_t) ref::row_bytes(ed.type, NFF),
-                    N, NFF};
-        ma.gu_stride = (uint64_t) ma.gu_row * NFF;
-        ma.d_stride = (uint64_t) ma.d_row * N;
-        const size_t ebase = moe_rebase(ma.gate_off, ma.up_off, ma.down_off);
-        const uint32_t ne = N;
-        const bool hg = had_gu(l), hd = had_dn(l);
-        if (hg) had_rows(ds, b.lib, "pc:", b.mixed, 0, b.mixr, 0, nT, N, hsx_.handle ? &hsx_ : nullptr, false);
-        mtl::Dispatch g;
-        g.p = P_(b.lib, "mm_gather");
-        g.args = {mtl::Arg::B(hg ? b.mixr : b.mixed), mtl::Arg::B(b.stok), mtl::Arg::B(b.XS), mtl::Arg::V(ne)};
-        g.tg[0] = 256;
-        g.indirect = &b.meta;
-        g.ind_off = 8 * 4;
-        ds.push_back(g);
-        auto tl3 = [](const int* t) { return std::to_string(t[0]) + "_" + std::to_string(t[1]) + "_" + std::to_string(t[2]) + "_" + std::to_string(t[3]); };
-        mtl::Dispatch gu;
-        if (b.v3e) {
-            const std::string fn = "mm_gu3_" + std::to_string(eg.type) + "_" + tl3(b.gu3);
-            gu.p = P_(b.lib, fn, mtl::Constants().b(7, true), fn + "#k4");
+        if (lat_) {
+            // D -> xl, the experts at the latent width on their group's xl row, the weighted outputs summed by group, U
+            const int G = lat_G_, ELL = lat_ELL_, I = lat_I_;
+            const int ty = lat_fmt_ == 4 ? ref::Q4_0 : ref::Q8_0;
+            const size_t rbk = lat_fmt_ == 4 ? 18 : 34;
+            const size_t dby = (size_t) G * ELL * (N / 32) * rbk, urow = (size_t) (ELL / 32) * rbk, lbase = (size_t) l * 2 * dby;
+            const PcLatArgs la{(uint32_t) G, (uint32_t) b.tm, (uint32_t) ELL, (uint32_t) nT, TOPK, N, 0, 0};
+            auto dql = [&](size_t off, int n_in, int n_out, const mtl::Buffer& out) {
+                PcDqArgs a{(uint32_t) n_in, (uint32_t) n_out, (uint32_t) ref::row_bytes(ty, n_in), 0};
+                D(P_(b.lib, "dq_f16_" + std::to_string(ty)), {mtl::Arg::B(LD_, off), mtl::Arg::B(out), mtl::Arg::V(a)},
+                  (n_in / pc_unit_of(ty) + 63) / 64, n_out, 64);
+            };
+            dql(lbase, N, G * ELL, b.LWD);
+            gemm(b.mixh, b.LWD, b.LXL, nT, G * ELL, N);
+            D(P_(b.lib, "lat_mm_rows"), {mtl::Arg::B(b.tiles), mtl::Arg::B(b.meta), mtl::Arg::B(b.stok),
+                                        mtl::Arg::B(lab_, (size_t) l * NEXP * 4), mtl::Arg::B(b.lrow), mtl::Arg::V(la)},
+              (b.maxrows / b.tm + 255) / 256, 1, 256);
+            PcMmArgs ma{0, 0, 0, lat_blob_, lat_blob_, (uint32_t) ref::row_bytes(ref::Q3_K, ELL),
+                        (uint32_t) ref::row_bytes(ref::IQ4_NL, I), (uint32_t) ELL, (uint32_t) I};
+            ma.up_off = (uint64_t) I * ma.gu_row;
+            ma.down_off = 2 * ma.up_off;
+            const size_t ebase = (size_t) l * NEXP * lat_blob_;
+            mtl::Dispatch g;
+            g.p = P_(b.lib, "lat_mm_gather");
+            g.args = {mtl::Arg::B(b.LXL), mtl::Arg::B(b.lrow), mtl::Arg::B(linv_, (size_t) l * ELL * 4), mtl::Arg::B(b.XS), mtl::Arg::V(la)};
+            g.tg[0] = 256;
+            g.indirect = &b.meta;
+            g.ind_off = 8 * 4;
+            ds.push_back(g);
+            mtl::Dispatch gu;
+            const std::string gun = "mm_gu2_" + std::to_string((int) ref::Q3_K) + PC_LAT_GU;
+            gu.p = P_(b.lib, gun, mtl::Constants().i(5, 0), gun + "#p0");
+            gu.args = {mtl::Arg::B(LA_, ebase), mtl::Arg::B(b.XS), mtl::Arg::B(b.HS), mtl::Arg::B(b.tiles), mtl::Arg::V(ma)};
+            gu.tg[0] = 32 * PC_LAT_GU_SG;
+            gu.indirect = &b.meta;
+            gu.ind_off = 2 * 4;
+            ds.push_back(gu);
+            mtl::Dispatch dn;
+            dn.p = P_(b.lib, "mm_down2_" + std::to_string((int) ref::IQ4_NL) + PC_LAT_DN);
+            dn.args = {mtl::Arg::B(LA_, ebase), mtl::Arg::B(b.HS), mtl::Arg::B(b.YE), mtl::Arg::B(b.tiles), mtl::Arg::V(ma)};
+            dn.tg[0] = 32 * PC_LAT_DN_SG;
+            dn.indirect = &b.meta;
+            dn.ind_off = 5 * 4;
+            ds.push_back(dn);
+            D(P_(b.lib, "lat_mm_group"), {mtl::Arg::B(b.YE), mtl::Arg::B(b.pos), mtl::Arg::B(b.sw), mtl::Arg::B(b.ids),
+                                         mtl::Arg::B(lab_, (size_t) l * NEXP * 4), mtl::Arg::B(b.LZH), mtl::Arg::V(la)},
+              (uint32_t) (((size_t) nT * ELL + 255) / 256), 1, 256);
+            for (int gq = 0; gq < G; ++gq) {
+                dql(lbase + dby + (size_t) gq * N * urow, ELL, N, b.LWU);
+                int tm = 64, tn = 64;
+                gemm_tile(cx_->device_name(), N, ELL, tm, tn);
+                PcGemmArgs ga{nT, N, ELL, 0};
+                D(P_(b.lib, "gemm_f16_" + std::to_string(tm) + "_" + std::to_string(tn) + "_4"),
+                  {mtl::Arg::B(b.LZH, (size_t) gq * nT * ELL * 2), mtl::Arg::B(b.LWU), mtl::Arg::B(b.LYU, (size_t) gq * nT * N * 4),
+                   mtl::Arg::V(ga)}, (N + tn - 1) / tn, (nT + tm - 1) / tm, 128);
+            }
+            D(P_(b.lib, "lat_mm_usum"), {mtl::Arg::B(b.LYU), mtl::Arg::B(b.yr), mtl::Arg::V(la)}, (nT * N + 255) / 256, 1, 256);
         } else {
-            const std::string fn = "mm_gu2_" + std::to_string(eg.type) + gu2_tile(eg.type);
-            gu.p = P_(b.lib, fn, mtl::Constants().i(5, 0), fn + "#p0");
+            const gguf::Tensor &eg = T(bl + "ffn_gate_exps.weight"), &eu = T(bl + "ffn_up_exps.weight"), &ed = T(bl + "ffn_down_exps.weight");
+            PcMmArgs ma{eg.offset, eu.offset, ed.offset, 0, 0, (uint32_t) ref::row_bytes(eg.type, N), (uint32_t) ref::row_bytes(ed.type, NFF),
+                        N, NFF};
+            ma.gu_stride = (uint64_t) ma.gu_row * NFF;
+            ma.d_stride = (uint64_t) ma.d_row * N;
+            const size_t ebase = moe_rebase(ma.gate_off, ma.up_off, ma.down_off);
+            const uint32_t ne = N;
+            const bool hg = had_gu(l), hd = had_dn(l);
+            if (hg) had_rows(ds, b.lib, "pc:", b.mixed, 0, b.mixr, 0, nT, N, hsx_.handle ? &hsx_ : nullptr, false);
+            mtl::Dispatch g;
+            g.p = P_(b.lib, "mm_gather");
+            g.args = {mtl::Arg::B(hg ? b.mixr : b.mixed), mtl::Arg::B(b.stok), mtl::Arg::B(b.XS), mtl::Arg::V(ne)};
+            g.tg[0] = 256;
+            g.indirect = &b.meta;
+            g.ind_off = 8 * 4;
+            ds.push_back(g);
+            auto tl3 = [](const int* t) { return std::to_string(t[0]) + "_" + std::to_string(t[1]) + "_" + std::to_string(t[2]) + "_" + std::to_string(t[3]); };
+            mtl::Dispatch gu;
+            if (b.v3e) {
+                const std::string fn = "mm_gu3_" + std::to_string(eg.type) + "_" + tl3(b.gu3);
+                gu.p = P_(b.lib, fn, mtl::Constants().b(7, true), fn + "#k4");
+            } else {
+                const std::string fn = "mm_gu2_" + std::to_string(eg.type) + gu2_tile(eg.type);
+                gu.p = P_(b.lib, fn, mtl::Constants().i(5, 0), fn + "#p0");
+            }
+            gu.args = {mtl::Arg::B(W_, ebase), mtl::Arg::B(b.XS), mtl::Arg::B(b.HS), mtl::Arg::B(b.tiles), mtl::Arg::V(ma)};
+            gu.tg[0] = b.v3e ? 32 * b.gu3[3] : 64;
+            gu.indirect = &b.meta;
+            gu.ind_off = 2 * 4;
+            ds.push_back(gu);
+            if (hd) had_rows_ind(ds, b.lib, "pc:", b.HS, b.meta);
+            mtl::Dispatch dn;
+            if (b.v3e) {
+                const std::string fn = "mm_down3_" + std::to_string(ed.type) + "_" + tl3(b.dn3);
+                dn.p = P_(b.lib, fn, mtl::Constants().b(7, true), fn + "#k4");
+            } else {
+                dn.p = P_(b.lib, "mm_down2_" + std::to_string(ed.type) + dn2_tile(ed.type));
+            }
+            dn.args = {mtl::Arg::B(W_, ebase), mtl::Arg::B(b.HS), mtl::Arg::B(b.YE), mtl::Arg::B(b.tiles), mtl::Arg::V(ma)};
+            dn.tg[0] = b.v3e ? 32 * b.dn3[3] : 64;
+            dn.indirect = &b.meta;
+            dn.ind_off = 5 * 4;
+            ds.push_back(dn);
+            const uint32_t ca[4] = {(uint32_t) nT, N, TOPK, 0};
+            D(P_(b.lib, "mm_combine"), {mtl::Arg::B(b.YE), mtl::Arg::B(b.pos), mtl::Arg::B(b.sw), mtl::Arg::B(b.yr), mtl::Arg::V(ca)},
+              (nT * N + 255) / 256, 1, 256);
         }
-        gu.args = {mtl::Arg::B(W_, ebase), mtl::Arg::B(b.XS), mtl::Arg::B(b.HS), mtl::Arg::B(b.tiles), mtl::Arg::V(ma)};
-        gu.tg[0] = b.v3e ? 32 * b.gu3[3] : 64;
-        gu.indirect = &b.meta;
-        gu.ind_off = 2 * 4;
-        ds.push_back(gu);
-        if (hd) had_rows_ind(ds, b.lib, "pc:", b.HS, b.meta);
-        mtl::Dispatch dn;
-        if (b.v3e) {
-            const std::string fn = "mm_down3_" + std::to_string(ed.type) + "_" + tl3(b.dn3);
-            dn.p = P_(b.lib, fn, mtl::Constants().b(7, true), fn + "#k4");
-        } else {
-            dn.p = P_(b.lib, "mm_down2_" + std::to_string(ed.type) + dn2_tile(ed.type));
-        }
-        dn.args = {mtl::Arg::B(W_, ebase), mtl::Arg::B(b.HS), mtl::Arg::B(b.YE), mtl::Arg::B(b.tiles), mtl::Arg::V(ma)};
-        dn.tg[0] = b.v3e ? 32 * b.dn3[3] : 64;
-        dn.indirect = &b.meta;
-        dn.ind_off = 5 * 4;
-        ds.push_back(dn);
-        const uint32_t ca[4] = {(uint32_t) nT, N, TOPK, 0};
-        D(P_(b.lib, "mm_combine"), {mtl::Arg::B(b.YE), mtl::Arg::B(b.pos), mtl::Arg::B(b.sw), mtl::Arg::B(b.yr), mtl::Arg::V(ca)},
-          (nT * N + 255) / 256, 1, 256);
         gemm(b.mixh, b.Wshg, b.gsh, nT, NFF, N);
         gemm(b.mixh, b.Wshu, b.ush, nT, NFF, N);
         const uint32_t nh = (uint32_t) nT * NFF;
