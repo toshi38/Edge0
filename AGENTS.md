@@ -9,8 +9,10 @@ Everything is under `edge0-strata/`, Edge0's fork of the Strata engine.
 - `metal/`: upstream Strata's Metal engine, restored from Niko1221/Strata at the fork's merge base, plus the latent layer.
 - `metal/kernels/latent.metal`: the three kernels that are the latent layer's own (`lat_colscale`, `lat_plan_rows`, `lat_group_sum`). D, U and the experts run on the existing `gemv.metal` and `moe.metal`.
 - `metal/src/engine/window.cpp`: the decode window. `latent_init` maps the packs, `latent_moe` queues a latent layer, `latent_warm` reads the packs ahead at start.
+- `metal/src/engine/prompt_chain.inc` (`pc_chunk`) and `metal/kernels/latent_mm.metal`: the prompt path, chunks of up to 2048 rows on the matrix units. Its latent branch runs D and U as dense GEMMs and the experts as grouped GEMMs at the latent width.
 - `metal/src/engine/stubs_edge0.cpp`: CUDA entry points the shared host code references and Metal does not implement. Each stops the engine and prints its name when reached, which is how a missing piece shows itself.
 - `metal/tests/latent_parity.cpp`: one latent layer on the Metal kernels against a double-precision reference.
+- `metal/tests/latent_chunk_parity.cpp`: the same check for one latent layer of a prompt chunk, with the time of each stage.
 
 A latent layer: `xl[t][g] = (D_g . x[t]) / s` for 8 groups, each routed expert reads the row of its group label and computes `yl = down . (silu(gate . xl) * (up . xl))` at the latent width, and the output is the weighted sum of `U_g . yl`. U is linear, so the window sums the weighted `yl` by group and runs one GEMV a group.
 
@@ -35,6 +37,13 @@ Shaders compile at run time, so a shader error appears on the first run, not in 
 ```
 
 It prints the relative error against the reference (about 3e-7 is normal), the layer's time, and PASS or FAIL. It loads one layer, about 1 GB, so it is safe to run at any time. Run it after any change to the latent path.
+
+```sh
+./build-metal/latent_chunk_parity                                               # a chunk of 256 rows, random weights
+./build-metal/latent_chunk_parity --pack $MODEL_DIR --layer 20 --ntok 2048      # the pack's own weights
+```
+
+The chunk path multiplies fp16 operands, so its error is about 7e-4. Run it after any change to the prompt chain's latent branch or to `moe_mm.metal`. Time it only while the engine is not running: both use the GPU.
 
 ## Run
 

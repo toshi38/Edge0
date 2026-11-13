@@ -153,6 +153,7 @@ struct PromptBufs {
     // a latent pack's chunk: D rows as fp16, xl [C][G][ELL], each padded row's xl row, z as fp16 [G][C][ELL], a group's
     // U rows as fp16, the groups' outputs [G][C][N]
     mtl::Buffer LWD, LXL, lrow, LZH, LWU, LYU;
+    std::vector<mtl::Buffer> owned;   // every buffer above, for pc_release
 };
 
 // The vision path (--vision, GENI requests), from the shared host code: the image rows of the prompt being read
@@ -367,7 +368,8 @@ private:
     bool routef_ = std::getenv("STRATA_METAL_ROUTE") && std::string(std::getenv("STRATA_METAL_ROUTE")) == "1";
     mtl::Buffer rcounter_;
     // STRATA_METAL_KPROF=T (test tooling): once, after the 20th cached window of T tokens with the head, the GPU time
-    // of each kernel class alone (the window's own dispatches of that pipeline + weight role, run by themselves)
+    // of each kernel class alone (the window's own dispatches of that pipeline + weight role, run by themselves).
+    // STRATA_METAL_KPROF_EVERY=N: again at every Nth such window, to see how the classes move as the context grows.
     void kprof(const std::vector<mtl::Dispatch>& ds, int Tn);
     void fold(std::vector<mtl::Dispatch>& ds, int n_keep, int hp);
     // the encoded window per (T, head, hp_): built once, then only the positions are patched (the host's encode cost)
@@ -510,6 +512,7 @@ private:
     int m5_layout_ = -1;   // the M5's matmul2d layout (coop_k4), asked once: the M4's tiles differ
     bool m5_layout() { if (m5_layout_ < 0) m5_layout_ = coop_k4() ? 1 : 0; return m5_layout_ == 1; }
     bool pc_setup(int C);
+    void pc_release();
     bool pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& err);
     // the draft round in one command buffer (msl/mtp_chain.metal): STRATA_METAL_MTP_CHAIN=0 runs a command buffer
     // per step with the host's pick and embedding (as before)
@@ -1298,7 +1301,7 @@ bool Window::latent_init(std::string& err) {
         for (int g = 0; g < G; ++g) uplan_.as<int32_t>()[P_TOKENT + t * G + g] = g * MAXT + t;
     lat_ = true;
     std::fprintf(stderr, "strata metal: latent MoE (%d groups, latent width %d, expert width %d, D/U Q%d_0): %.1f GB of experts, "
-                 "%.1f GB of D/U wrapped; prompts go through decode windows\n", G, ELL, I, lat_fmt_, a_bytes / 1e9, d_bytes / 1e9);
+                 "%.1f GB of D/U wrapped\n", G, ELL, I, lat_fmt_, a_bytes / 1e9, d_bytes / 1e9);
     return true;
 }
 
@@ -1558,8 +1561,12 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         last_gpu_ms_ = 1000.0 * run_ds(c);
         {
             static const int kt = std::getenv("STRATA_METAL_KPROF") ? std::atoi(std::getenv("STRATA_METAL_KPROF")) : 0;
+            static const int every = std::getenv("STRATA_METAL_KPROF_EVERY") ? std::atoi(std::getenv("STRATA_METAL_KPROF_EVERY")) : 0;
             static int seen = 0;
-            if (kt == Tn && head && ++seen == 20 && !stream_) kprof(c.ds, Tn);
+            if (kt == Tn && head && !stream_ && (++seen == 20 || (every > 0 && seen % every == 0))) {
+                std::fprintf(stderr, "strata metal kprof: at cell %lld\n", (long long) pos0);
+                kprof(c.ds, Tn);
+            }
         }
         tp_rg_ = now_ms() - r0;
         last_n_disp_ = (int) c.ds.size();
@@ -3335,9 +3342,7 @@ bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* con
 bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
                      const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
     if (g_window == nullptr) { err = "metal prompt: the decode window is not up yet"; return false; }
-    // a latent pack reads its prompt through decode windows unless STRATA_METAL_PROMPT=chunk asks for the prompt chain
-    static const std::string mode = std::getenv("STRATA_METAL_PROMPT") ? std::getenv("STRATA_METAL_PROMPT") : "";
-    static const bool windows = mode == "window" || (g_window->latent() && mode != "chunk");
+    static const bool windows = std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window";
     static const int64_t min_rows = std::getenv("STRATA_METAL_PROMPT_MIN") ? std::atoll(std::getenv("STRATA_METAL_PROMPT_MIN")) : 32;
     if (!windows && !g_window->streaming() && n >= min_rows) return g_window->prompt(tokens, n, pos0, on_chunk, err);
     if (!windows && g_window->streaming()) {

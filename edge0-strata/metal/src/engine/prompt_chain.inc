@@ -6,9 +6,10 @@
 // window's history parity, RoPE table and pending fold.  No head: the last prompt token runs as a decode window.
 //
 // The 8-row-window prompt path stays as the fallback: STRATA_METAL_PROMPT=window, and prompts shorter than
-// STRATA_METAL_PROMPT_MIN rows (default 32).  STRATA_METAL_PROMPT_CHUNK = C (default 2048).  The kernel variants
-// follow prompt_chain's defaults: matrix-unit register operands where the GPU has the M5's right-input layout
-// (COOP_K4, function constant 7), else the older expert and attention kernels (the M4).
+// STRATA_METAL_PROMPT_MIN rows (default 32).  STRATA_METAL_PROMPT_CHUNK = C (default 2048, 1024 for a latent pack).
+// The kernel variants follow prompt_chain's defaults: matrix-unit register operands where the GPU has the M5's
+// right-input layout (COOP_K4, function constant 7), else the older expert and attention kernels (the M4).  A latent
+// pack (Edge0 120B / 145B) runs its routed experts through D, the experts at the latent width and U (latent_mm.metal).
 
 namespace {
 constexpr int PC_QB = 2051, PC_QCHUNKS = 33, PC_TM = 16;
@@ -56,14 +57,14 @@ bool Window::pc_setup(int C) {
     PromptBufs& b = pb_;
     if (b.C >= C) return true;
     const double t0 = now_ms();
-    if (b.C == 0) {
+    if (b.lib < 0) {
         b.lib = cx_->compile({"quant.metal", "units.metal", "mma.metal", "dense_mm.metal", "moe_mm.metal", "gr.metal",
                               "gemv.metal", "prompt.metal", "latent_mm.metal"});
         b.lgdn = cx_->compile({"gdn.metal", "gdn_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
         b.lqsa = cx_->compile({"qsa.metal", "qsa_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
         b.k4 = coop_k4();
     }
-    b = PromptBufs{b.lib, b.lgdn, b.lqsa, b.k4};   // (re)allocated below for the larger chunk
+    pc_release();   // (re)allocated below for the larger chunk
     // the trellis experts have the v2 kernels only, and so has a latent pack
     b.v3e = b.k4 && !lat_ && T("blk.0.ffn_gate_exps.weight").type < 144;
     b.C = C;
@@ -72,8 +73,9 @@ bool Window::pc_setup(int C) {
     b.tm = lat_ ? PC_LAT_TM : PC_TM;
     b.maxrows = (int) MT * TOPK + NEXP * b.tm;
     const int nblk_max = ((int) MT * TOPK + 1023) / 1024;
-    auto F32 = [&](size_t n) { return cx_->alloc(4 * n); };
-    auto F16 = [&](size_t n) { return cx_->alloc(2 * n); };
+    auto AL = [&](size_t bytes) { b.owned.push_back(cx_->alloc(bytes)); return b.owned.back(); };
+    auto F32 = [&](size_t n) { return AL(4 * n); };
+    auto F16 = [&](size_t n) { return AL(2 * n); };
     b.R = F32(MT * HC * N); b.bo = F32(MT * N); b.inj[0] = F32(MT * HC); b.inj[1] = F32(MT * HC); b.xn = F32(MT * HC * N);
     b.xnh = F16(MT * HC * N); b.V = F32(MT * (LR + HC)); b.loh = F16(MT * LR); b.mixed = F32(MT * N); b.mixh = F16(MT * N);
     b.fused = gdn_fused_inputs(cx_->device_name());
@@ -88,12 +90,12 @@ bool Window::pc_setup(int C) {
     b.ggb = F32(MT * 48 * 2); b.gkq = F32(MT * 16); b.go = F32(MT * 6144);
     b.qfull = F32(MT * 12288); b.kcur = F32(MT * 512); b.vcur = F32(MT * 512); b.iqr = F32(MT * 512); b.ikr = F32(MT * 128);
     b.qcur = F32(MT * 24 * 256); b.qcurh = F16(MT * 24 * 256); b.qidx = F32(MT * 4 * 128); b.scores = F32(MT * MB);
-    b.qids = cx_->alloc(4 * MT * PC_QB); b.part = F32(MT * PC_QCHUNKS * 24 * 258); b.XQ = F32(4 * MT * 6144 + MT * 384);
+    b.qids = AL(4 * MT * PC_QB); b.part = F32(MT * PC_QCHUNKS * 24 * 258); b.XQ = F32(4 * MT * 6144 + MT * 384);
     b.xqh = F16(MT * 6144);
-    b.logits = F32(MT * NEXP); b.ids = cx_->alloc(4 * MT * TOPK); b.wts = F32(MT * TOPK);
-    b.bcnt = cx_->alloc(4 * (size_t) nblk_max * NEXP); b.boff = cx_->alloc(4 * (size_t) nblk_max * NEXP);
-    b.eoff = cx_->alloc(4 * NEXP); b.tiles = cx_->alloc(8 * (size_t) (b.maxrows / PC_TM + 1)); b.meta = cx_->alloc(64);
-    b.stok = cx_->alloc(4 * (size_t) b.maxrows); b.sw = F32(b.maxrows); b.pos = cx_->alloc(4 * MT * TOPK);
+    b.logits = F32(MT * NEXP); b.ids = AL(4 * MT * TOPK); b.wts = F32(MT * TOPK);
+    b.bcnt = AL(4 * (size_t) nblk_max * NEXP); b.boff = AL(4 * (size_t) nblk_max * NEXP);
+    b.eoff = AL(4 * NEXP); b.tiles = AL(8 * (size_t) (b.maxrows / PC_TM + 1)); b.meta = AL(64);
+    b.stok = AL(4 * (size_t) b.maxrows); b.sw = F32(b.maxrows); b.pos = AL(4 * MT * TOPK);
     b.XS = F16((size_t) b.maxrows * N); b.HS = F16((size_t) b.maxrows * NFF); b.YE = F32((size_t) b.maxrows * N);
     b.yr = F32(MT * N); b.gsh = F32(MT * NFF); b.ush = F32(MT * NFF); b.hh = F16(MT * NFF); b.ys = F32(MT * N); b.sgv = F32(MT);
     b.WD = F16((size_t) (LR + HC) * HC * N); b.WU = F16((size_t) HC * N * LR);
@@ -120,15 +122,25 @@ bool Window::pc_setup(int C) {
     b.meta.as<uint32_t>()[5] = b.v3e ? N / (b.dn3[1] * b.dn3[3]) : N / 64;
     if (lat_) {
         const size_t G = (size_t) lat_G_, ELL = (size_t) lat_ELL_;
-        b.LWD = F16(G * ELL * N); b.LXL = F32(MT * G * ELL); b.lrow = cx_->alloc(4 * (size_t) b.maxrows);
+        b.LWD = F16(G * ELL * N); b.LXL = F32(MT * G * ELL); b.lrow = AL(4 * (size_t) b.maxrows);
         b.LZH = F16(G * MT * ELL); b.LWU = F16((size_t) N * ELL); b.LYU = F32(G * MT * N);
         b.meta.as<uint32_t>()[2] = (uint32_t) (lat_I_ / PC_LAT_GU_TN);   // the gate/up GEMM's grid: the expert width in tiles
         b.meta.as<uint32_t>()[5] = (uint32_t) (lat_ELL_ / PC_LAT_DN_TN);   // the down GEMM's: the latent width
     }
-    std::fprintf(stderr, "strata metal: prompt kernels (mac-kern's prompt chain) for chunks of %d rows, %s, ready in %.0f ms\n",
-                 C, b.k4 ? "matrix-unit register operands (COOP_K4)" : "the older expert / attention kernels (no M5 layout)",
+    size_t bytes = 0;
+    for (const mtl::Buffer& x : b.owned) bytes += x.bytes;
+    std::fprintf(stderr, "strata metal: prompt kernels (mac-kern's prompt chain) for chunks of %d rows, %.2f GB of buffers, %s, ready in %.0f ms\n",
+                 C, bytes / 1e9, b.k4 ? "matrix-unit register operands (COOP_K4)" : "the older expert / attention kernels (no M5 layout)",
                  now_ms() - t0);
     return true;
+}
+
+// The chunk buffers given back (the kernel libraries and the layout probe are kept): the next prompt allocates them
+// again for its own length.
+void Window::pc_release() {
+    PromptBufs& b = pb_;
+    for (mtl::Buffer& x : b.owned) cx_->free(x);
+    b = PromptBufs{b.lib, b.lgdn, b.lqsa, b.k4};
 }
 
 // one chunk of nT rows at cells pos0.. (the window state is exactly at pos0 before, at pos0 + nT after)
@@ -508,9 +520,11 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
 
 bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
                     const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
-    static const int C = [] {
+    // A latent pack reads in chunks of 1024: as fast as 2048 on an M4 Max (about 400 tok/s from 8K to 28K tokens for
+    // both, 310 for 512) with 2.6 GB of chunk buffers in place of 4.6.
+    static const int C = [this] {
         const char* e = std::getenv("STRATA_METAL_PROMPT_CHUNK");
-        return std::max(64, std::min(8192, e ? std::atoi(e) : 2048));
+        return std::max(64, std::min(8192, e ? std::atoi(e) : lat_ ? 1024 : 2048));
     }();
     if (!pc_setup((int) std::min<int64_t>(C, std::max<int64_t>(n, 64)))) { err = "metal prompt: setup failed"; return false; }
     const double t0 = now_ms();
@@ -528,9 +542,14 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
             if (!ok) return false;
         }
     }
+    // A latent pack leaves a 64 GB Mac a few GB: the chunk buffers are given back after the prompt.
+    // STRATA_METAL_PROMPT_KEEP=1 keeps them (0 gives them back for every model).
+    static const int keep = std::getenv("STRATA_METAL_PROMPT_KEEP") ? std::atoi(std::getenv("STRATA_METAL_PROMPT_KEEP")) : -1;
+    const double gpu_ms = pb_.gpu_ms, host_ms = pb_.host_ms, mtp_ms = pb_.mtp_ms;
+    if (keep == 0 || (keep < 0 && lat_)) pc_release();
     if (std::getenv("STRATA_METAL_TRACE") || std::getenv("STRATA_METAL_PROFILE"))
         std::fprintf(stderr, "strata metal: prompt %lld tokens in %.1f ms (GPU %.1f ms, host rows %.1f ms, drafter rows %.1f ms) "
-                             "-> %.1f tok/s\n", (long long) n, now_ms() - t0, pb_.gpu_ms, pb_.host_ms, pb_.mtp_ms,
+                             "-> %.1f tok/s\n", (long long) n, now_ms() - t0, gpu_ms, host_ms, mtp_ms,
                      1000.0 * (double) n / (now_ms() - t0));
     return true;
 }
