@@ -544,6 +544,12 @@ void require_fit(const Pipeline& p, uint32_t threads, const char* where) {
     std::exit(6);
 }
 
+// STRATA_METAL_ALLOC_LOG=1: every allocation of 16 MB or more, with the running total (the host runtime logs its own)
+static void alloc_log(size_t n, size_t total) {
+    static const bool on = std::getenv("STRATA_METAL_ALLOC_LOG") != nullptr;
+    if (on && n >= ((size_t) 16 << 20)) std::fprintf(stderr, "strata metal context: alloc %.1f MB (total %.2f GB)\n", n / 1e6, total / 1e9);
+}
+
 Buffer Context::alloc(size_t bytes) {
 #if defined(STRATA_DS4_RUNTIME)
     // Metal returns the new buffer with one more reference parked in the calling thread's autorelease pool.  The engine's host
@@ -562,19 +568,24 @@ Buffer Context::alloc(size_t bytes) {
         r.ptr = [b contents];
     }
     allocated_ += bytes;
+    alloc_log(bytes, allocated_);
     r.bytes = bytes;
     return r;
 #else
-    id<MTLBuffer> b = [impl_->dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-    if (!b) {
-        std::fprintf(stderr, "mtl: alloc %zu failed\n", bytes);
-        std::exit(4);
-    }
-    std::memset([b contents], 0, bytes);
-    allocated_ += bytes;
+    // (the pool: as above, so that free() gives the memory back when the caller's thread has no pool of its own)
     Buffer r;
-    r.handle = (__bridge_retained void*)b;
-    r.ptr = [b contents];
+    @autoreleasepool {
+        id<MTLBuffer> b = [impl_->dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!b) {
+            std::fprintf(stderr, "mtl: alloc %zu failed\n", bytes);
+            std::exit(4);
+        }
+        std::memset([b contents], 0, bytes);
+        r.handle = (__bridge_retained void*)b;
+        r.ptr = [b contents];
+    }
+    allocated_ += bytes;
+    alloc_log(bytes, allocated_);
     r.bytes = bytes;
     return r;
 #endif
