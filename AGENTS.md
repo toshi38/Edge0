@@ -72,6 +72,7 @@ The engine wires the whole pack once the GPU has used it: about 50 GB on the 145
 
 ## How work is tracked
 
+- Start each session with the upstream check in issue #8: if Edge0 has released its own macOS engine, compare with it before doing more.
 - Each piece of work is an issue. Before starting one, read it; when measuring something, put the numbers in a comment on it; tick its checkboxes as they are met.
 - A change that is not covered by an issue gets one first, even a short one.
 - Commit messages name the issue (`refs #3`, `closes #1`).
