@@ -78,6 +78,21 @@ The engine wires the whole pack once the GPU has used it: about 50 GB on the 145
 - Commit messages name the issue (`refs #3`, `closes #1`).
 - Every claim of speed or correctness comes with the measurement and how it was taken. An estimate is labelled as one.
 
+## Pushing
+
+Push to the fork as work lands: after each commit or small group of commits that builds and passes `latent_parity`. Unpushed work is unbacked work. The fork is public, so every push is checked first:
+
+```sh
+LEAK_PATTERNS=<private pattern file> tools/leak_check.sh     # the commits the fork does not have yet
+git push fork <branch>
+```
+
+`tools/leak_check.sh` scans the added lines, commit messages and commit identities for home-directory paths, email addresses, credential formats and the private patterns, then runs gitleaks on the same commits. Push only on "clean" (exit 0). Exit 2 means the check was incomplete (no private pattern file, or gitleaks missing): fix that, do not push on it. On a hit, rewrite the commit so the detail never enters history; do not push and then delete.
+
+The private pattern file lists the names and words that must not appear. It lives outside the repository, because the list itself would be a leak here.
+
+The same care applies to issues and comments, which no script checks: read them before posting.
+
 ## Conventions
 
 - Comments and docstrings describe the code as it is, never how it got there. History goes in commit messages.
