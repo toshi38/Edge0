@@ -89,6 +89,8 @@ git push fork <branch>
 
 `tools/leak_check.sh` scans the added lines, commit messages and commit identities for home-directory paths, email addresses, credential formats and the private patterns, then runs gitleaks on the same commits. Push only on "clean" (exit 0). Exit 2 means the check was incomplete (no private pattern file, or gitleaks missing): fix that, do not push on it. On a hit, rewrite the commit so the detail never enters history; do not push and then delete.
 
+A clone used for this work should run the check from a `pre-push` hook (`.git/hooks/pre-push`: set `LEAK_PATTERNS`, call `tools/leak_check.sh` with the range of each ref being pushed, refuse on any non-zero exit), so a push cannot skip it. Hooks are local to a clone: check that it exists before relying on it.
+
 The private pattern file lists the names and words that must not appear. It lives outside the repository, because the list itself would be a leak here.
 
 The same care applies to issues and comments, which no script checks: read them before posting.
