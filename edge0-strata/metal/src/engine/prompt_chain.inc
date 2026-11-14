@@ -55,6 +55,7 @@ bool Window::coop_k4() {
 
 bool Window::pc_setup(int C) {
     PromptBufs& b = pb_;
+    pc_idle(false);
     if (b.C >= C) return true;
     const double t0 = now_ms();
     if (b.lib < 0) {
@@ -139,6 +140,7 @@ bool Window::pc_setup(int C) {
 // again for its own length.
 void Window::pc_release() {
     PromptBufs& b = pb_;
+    pc_idle_ = false;
     for (mtl::Buffer& x : b.owned) cx_->free(x);
     b = PromptBufs{b.lib, b.lgdn, b.lqsa, b.k4};
 }
@@ -170,6 +172,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         if (!ss.ple.table->gather_batch(rows.data(), (size_t) nT, b.pemb.as<float>(), err)) return false;
     }
     b.host_ms += now_ms() - th0;
+    const double tb0 = now_ms();
     std::vector<mtl::Dispatch> ds;
     ds.reserve(2400);
     nb_ = false;
@@ -299,7 +302,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
                mtl::Arg::B(ksc_[(size_t) qi]), mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(tail_[(size_t) qi]),
                mtl::Arg::B(dead_[(size_t) qi]), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::V(a), mtl::Arg::B(mrope_)},
               33, nT, 256);
-            if (pos0 + nT > PC_QB) {   // some row's context is past the budget: the indexer selects
+            if (pc_dry_ || pos0 + nT > PC_QB) {   // some row's context is past the budget: the indexer selects
                 if (b.k4)
                     D(P_(b.lqsa, "qsa_score_mm"), {mtl::Arg::B(b.qidx), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::B(dead_[(size_t) qi]),
                                                  mtl::Arg::B(b.scores), mtl::Arg::V(a)},
@@ -492,7 +495,11 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         D(P_(b.lib, "gr_norm"), {mtl::Arg::B(b.R), mtl::Arg::B(b.bo), mtl::Arg::B(b.inj[cur_inj]),
                                 mtl::Arg::B(W_, T("output_hc_norm.weight").offset), mtl::Arg::B(b.xn), mtl::Arg::V(a)}, HC, nT, 256);
     }
+    const double tr0 = now_ms();
     const double g = cx_->run(ds);
+    if (std::getenv("STRATA_METAL_PROFILE"))
+        std::fprintf(stderr, "strata metal: prompt chunk %d rows: host rows %.0f ms, %zu dispatches built in %.0f ms, run %.0f ms (GPU %.0f ms)\n", nT,
+                     tb0 - th0, ds.size(), tr0 - tb0, now_ms() - tr0, 1000.0 * g);
     b.gpu_ms += 1000.0 * g;
     hp_ = 1 - hp_;
     // the host side of the commit: the PLE history (the last 9 normalized rows) and the n-gram context
@@ -516,6 +523,50 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     }
     last_T_ = 0;   // nothing to commit
     return true;
+}
+
+// Between prompts the chunk buffers are kept but lent to the OS: freshly allocated buffers cost the next prompt about
+// 0.85 s a GB when the GPU first maps them (M4 Max: a 667-row chunk ran 3.1 s against 1.4 s of GPU time), kept ones cost
+// nothing, and volatile ones can still be discarded under memory pressure without swapping.  They are scratch: a chunk
+// writes what it reads, except the two grid constants in `meta`, which are written again here.
+void Window::pc_idle(bool idle) {
+    PromptBufs& b = pb_;
+    if (b.C == 0 || idle == pc_idle_) return;
+    for (mtl::Buffer& x : b.owned) cx_->set_idle(x, idle);
+    pc_idle_ = idle;
+    if (!idle) {
+        b.meta.as<uint32_t>()[2] = lat_ ? (uint32_t) (lat_I_ / PC_LAT_GU_TN) : b.v3e ? NFF / (b.gu3[1] * b.gu3[3]) : NFF / 64;
+        b.meta.as<uint32_t>()[5] = lat_ ? (uint32_t) (lat_ELL_ / PC_LAT_DN_TN) : b.v3e ? N / (b.dn3[1] * b.dn3[3]) : N / 64;
+    }
+}
+
+// The prompt chain run once at start, for a latent pack, so that the first prompt does not pay for first uses: the
+// pipeline states (about 1.5 s of a first prompt) and the GPU's first mapping of the chunk buffers (about 2.2 s for
+// 2.64 GB).  A full chunk of varied tokens is run and the window is put back as it was: reset() clears the running
+// state the chunk wrote, and the cells it filled are written again by the first real prompt before anything reads them.
+// STRATA_METAL_PROMPT_WARM=0 leaves it to the first prompt, STRATA_METAL_PROMPT_WARM_ROWS sets the chunk's rows.
+void Window::prompt_warm() {
+    const char* e = std::getenv("STRATA_METAL_PROMPT_WARM");
+    const char* m = std::getenv("STRATA_METAL_PROMPT");
+    if (!lat_ || stream_ || pend_fold_ > 0 || (e && std::string(e) == "0") || (m && std::string(m) == "window")) return;
+    const double t0 = now_ms();
+    static const int rows = [] { const char* r = std::getenv("STRATA_METAL_PROMPT_WARM_ROWS"); return r ? std::max(64, std::min(1024, std::atoi(r))) : 1024; }();
+    if (!pc_setup(rows)) return;
+    std::vector<int64_t> tk((size_t) rows);
+    uint64_t x = 0x9E3779B97F4A7C15ull;   // varied tokens, so that the chunk routes to (and the GPU maps) most experts
+    for (auto& t : tk) { x = x * 6364136223846793005ull + 1442695040888963407ull; t = (int64_t) ((x >> 33) % (uint64_t) n_vocab_); }
+    std::string err;
+    const int hp = hp_;
+    const int32_t prev[2] = {ss_->ple_prev[0], ss_->ple_prev[1]};
+    pc_dry_ = true;   // (also takes the indexer's selection kernels, which a short first chunk would not)
+    const bool ok = pc_chunk(tk.data(), rows, 0, err);
+    pc_dry_ = false;
+    reset();
+    hp_ = hp;
+    ss_->ple_prev[0] = prev[0];
+    ss_->ple_prev[1] = prev[1];
+    pc_idle(true);
+    std::fprintf(stderr, "strata metal: prompt chain run once at start (%d rows) in %.0f ms%s\n", rows, now_ms() - t0, ok ? "" : (" (failed: " + err + ")").c_str());
 }
 
 bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
@@ -543,11 +594,12 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
             if (!ok) return false;
         }
     }
-    // A latent pack leaves a 64 GB Mac a few GB: the chunk buffers are given back after the prompt.
-    // STRATA_METAL_PROMPT_KEEP=1 keeps them (0 gives them back for every model).
+    // A latent pack leaves a 64 GB Mac a few GB: its chunk buffers are lent to the OS until the next prompt (pc_idle).
+    // STRATA_METAL_PROMPT_KEEP=1 keeps them as they are, =0 frees them after every prompt (for every model).
     static const int keep = std::getenv("STRATA_METAL_PROMPT_KEEP") ? std::atoi(std::getenv("STRATA_METAL_PROMPT_KEEP")) : -1;
     const double gpu_ms = pb_.gpu_ms, host_ms = pb_.host_ms, mtp_ms = pb_.mtp_ms;
-    if (keep == 0 || (keep < 0 && lat_)) pc_release();
+    if (keep == 0) pc_release();
+    else if (keep < 0 && lat_) pc_idle(true);
     if (std::getenv("STRATA_METAL_TRACE") || std::getenv("STRATA_METAL_PROFILE"))
         std::fprintf(stderr, "strata metal: prompt %lld tokens in %.1f ms (GPU %.1f ms, host rows %.1f ms, drafter rows %.1f ms) "
                              "-> %.1f tok/s\n", (long long) n, now_ms() - t0, gpu_ms, host_ms, mtp_ms,

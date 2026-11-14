@@ -527,7 +527,13 @@ private:
     bool m5_layout() { if (m5_layout_ < 0) m5_layout_ = coop_k4() ? 1 : 0; return m5_layout_ == 1; }
     bool pc_setup(int C);
     void pc_release();
+    void pc_idle(bool idle);
+    bool pc_idle_ = false;   // the chunk buffers are lent to the OS (set_idle) until the next prompt
     bool pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& err);
+    bool pc_dry_ = false;   // prompt_warm's chunk: every kernel a chunk can use is queued
+public:
+    void prompt_warm();
+private:
     // the draft round in one command buffer (msl/mtp_chain.metal): STRATA_METAL_MTP_CHAIN=0 runs a command buffer
     // per step with the host's pick and embedding (as before)
     int lchain_ = -1;
@@ -3308,6 +3314,7 @@ bool window_init(void* w, const strata::core::ModelGeometry& g, strata::core::Se
         if (!x->init(g, ss, g_shard1, MAXT, max_cells, err)) return false;
         window_register(w);
         if (!mtp_load_pending(x, err)) return false;
+        x->prompt_warm();
     }
     x->set_max_t(max_t);
     *n_vocab = x->vocab();
