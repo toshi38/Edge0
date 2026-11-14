@@ -49,3 +49,46 @@ kernel void lat_group_sum(device const float* ye [[buffer(0)]], device const int
     }
     z[gid] = s;
 }
+
+// lat_live: the live latent groups of a decode window, for skipping the U GEMVs of groups no routed expert uses.
+// The plan holds P_NG distinct routed experts; group g is live if any of them has label g.  Writes, per group, the
+// U GEMV's indirect grid (its row count, or 0 for a dead group so the dispatch does no work and reads no weights),
+// and zeros a dead group's lyu rows for the live tokens, since the combine sums every group and a skipped GEMV would
+// otherwise leave the previous layer's output there.  One threadgroup.
+struct LatLiveArgs {
+    uint g;        // groups
+    uint n_tok;
+    uint n_out;    // U output width (the model width N): lyu row length and the live grid's gx numerator
+    uint maxt;     // lyu row stride between groups
+    uint ug_gx;    // the U GEMV's threadgroup count for a live group (host passes ceil(n_out / rpt))
+    uint pad0, pad1, pad2;
+};
+kernel void lat_live(device const int* plan [[buffer(0)]], device const int* labels [[buffer(1)]],
+                     device float* lyu [[buffer(2)]], device uint* ugrid [[buffer(3)]],
+                     constant LatLiveArgs& a [[buffer(4)]], uint tid [[thread_position_in_threadgroup]],
+                     uint nt [[threads_per_threadgroup]]) {
+    threadgroup atomic_uint live[16];
+    for (uint g = tid; g < a.g; g += nt) atomic_store_explicit(&live[g], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int ng = plan[P_NG];
+    for (int gi = int(tid); gi < ng; gi += int(nt)) {
+        const int lab = labels[plan[P_GEXP + gi]];
+        if (lab >= 0 && lab < int(a.g)) atomic_store_explicit(&live[lab], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup uint live_s[16];
+    for (uint g = tid; g < a.g; g += nt) {
+        const uint lv = atomic_load_explicit(&live[g], memory_order_relaxed);
+        live_s[g] = lv;
+        ugrid[g * 3 + 0] = lv ? a.ug_gx : 0u;
+        ugrid[g * 3 + 1] = 1u;
+        ugrid[g * 3 + 2] = 1u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // zero the dead groups' lyu rows for the live tokens (what moe_combine_sh reads)
+    const uint total = a.g * a.n_tok * a.n_out;
+    for (uint i = tid; i < total; i += nt) {
+        const uint c = i % a.n_out, gt = i / a.n_out, t = gt % a.n_tok, g = gt / a.n_tok;
+        if (!live_s[g]) lyu[(ulong)(g * a.maxt + t) * a.n_out + c] = 0.0f;
+    }
+}

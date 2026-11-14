@@ -117,6 +117,7 @@ struct GdnArgs { uint32_t h_k, h_v, channels, commit; float eps; uint32_t plane;
 struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; };
 struct GlueArgs { uint32_t n, n_tok, n_embd, topk; };
 struct LatArgs { uint32_t ell, rows, g, maxt, n_tok, pad0, pad1, pad2; };   // latent.metal
+struct LatLiveArgs { uint32_t g, n_tok, n_out, maxt, ug_gx, pad0, pad1, pad2; };   // latent.metal (lat_live)
 constexpr int LAT_MAXG = P_MAXE / MAXT;   // latent groups: the combine's plan holds one entry a (token, group), P_MAXE in all
 struct ArgArgs { uint32_t n_vocab, parts; };
 // the routed gate/up's i-quant grids from constant memory (QUANT_CTAB, function constant 23 of quant.metal): bitwise
@@ -314,11 +315,12 @@ private:
     int lat_G_ = 0, lat_ELL_ = 0, lat_I_ = 0, lat_fmt_ = 8;
     size_t lat_blob_ = 0;
     void *lat_a_map_ = nullptr, *lat_d_map_ = nullptr;
-    mtl::Buffer LA_, LD_, lab_, linv_, lxl_, lz_, lyu_, uplan_, LXb_, LZb_;
+    mtl::Buffer LA_, LD_, lab_, linv_, lxl_, lz_, lyu_, uplan_, LXb_, LZb_, ugrid_;
     bool latent_init(std::string& err);
     void latent_moe(std::vector<mtl::Dispatch>& ds, int l, int ntok, const std::string& b);
     void lat_gemv(std::vector<mtl::Dispatch>& ds, size_t w_off, int n_in, int n_out, const mtl::Buffer& xp, size_t plane,
-                  size_t row0, const mtl::Buffer& y, size_t y_off, size_t y_stride, int ntok);
+                  size_t row0, const mtl::Buffer& y, size_t y_off, size_t y_stride, int ntok,
+                  const mtl::Buffer* grid = nullptr, size_t grid_off = 0);
     int cur_inj_ = 0;
     // state
     std::vector<mtl::Buffer> gst_, ghist_[2], kq_, vq_, ksc_, vsc_, tail_, dead_, pooled_;
@@ -1339,6 +1341,7 @@ bool Window::latent_init(std::string& err) {
     LXb_ = A(4 * (4 * R * ELL + R * ELL / 16));
     LZb_ = A(4 * (4 * R * ELL + R * ELL / 16));
     uplan_ = A(4 * P_INTS);   // moe_combine_sh's entry of (token, k): here k is the group, its row in lyu_ is g * MAXT + t
+    ugrid_ = A(4 * (size_t) LAT_MAXG * 3);   // lat_live: the U GEMV's indirect grid a group (0 for a dead group)
     for (int t = 0; t < MAXT; ++t)
         for (int g = 0; g < G; ++g) uplan_.as<int32_t>()[P_TOKENT + t * G + g] = g * MAXT + t;
     // The window reads the model from the wrapped files; the device copies of the dense weights the shared host code
@@ -1358,7 +1361,8 @@ bool Window::latent_init(std::string& err) {
 
 // gemv() for the D/U pack: `xp` is a prepared activation buffer of `plane` bytes a kind, read from row `row0` on
 void Window::lat_gemv(std::vector<mtl::Dispatch>& ds, size_t w_off, int n_in, int n_out, const mtl::Buffer& xp, size_t plane,
-                      size_t row0, const mtl::Buffer& y, size_t y_off, size_t y_stride, int ntok) {
+                      size_t row0, const mtl::Buffer& y, size_t y_off, size_t y_stride, int ntok,
+                      const mtl::Buffer* grid, size_t grid_off) {
     const int ty = lat_fmt_ == 4 ? ref::Q4_0 : ref::Q8_0;
     if (mma_window(ty, n_in, n_out, ntok)) {   // (the raw plane is the first: row0's rows and the 7 after it are in the buffer)
         const std::string fn = "gemv_mma_" + std::to_string(ty) + "_1";
@@ -1366,7 +1370,7 @@ void Window::lat_gemv(std::vector<mtl::Dispatch>& ds, size_t w_off, int n_in, in
         mtl::Dispatch d;
         d.p = P(lib_, fn, mtl::Constants().i(4, ntok), fn + "#" + std::to_string(ntok));
         d.args = {mtl::Arg::B(LD_, w_off), mtl::Arg::B(xp, row0 * (size_t) n_in * 4), mtl::Arg::B(y, y_off), mtl::Arg::V(a)};
-        d.grid[0] = (n_out + 7) / 8;
+        if (grid) { d.indirect = grid; d.ind_off = grid_off; } else d.grid[0] = (n_out + 7) / 8;
         d.tg[0] = 32;
         push(ds, d);
         return;
@@ -1381,7 +1385,7 @@ void Window::lat_gemv(std::vector<mtl::Dispatch>& ds, size_t w_off, int n_in, in
     d.args = {mtl::Arg::B(LD_, w_off), mtl::Arg::B(xp, plane * xkind(ty) + row0 * (size_t) n_in * 4),
               mtl::Arg::B(xp, plane * 4 + row0 * (size_t) (n_in / 16) * 4), mtl::Arg::B(y, y_off), mtl::Arg::V(a)};
     const int rpt = (S / K) * (32 / L) * Rr;
-    d.grid[0] = (n_out + rpt - 1) / rpt;
+    if (grid) { d.indirect = grid; d.ind_off = grid_off; } else d.grid[0] = (n_out + rpt - 1) / rpt;
     d.tg[0] = S * 32;
     push(ds, d);
 }
@@ -1485,10 +1489,28 @@ void Window::latent_moe(std::vector<mtl::Dispatch>& ds, int l, int ntok, const s
         push(ds, d);
     }
     xprep_rows(lz_, LZb_);
+    // Skip the U GEMV of a latent group no routed expert uses (about a third of the 8 at one token on the 145B pack):
+    // lat_live writes each group's indirect grid (0 for a dead group) and zeros the dead groups' lyu rows, which z=0
+    // would make zero anyway.  Off by default; the base path is byte-for-byte unchanged.  STRATA_METAL_LATENT_SKIP=1.
+    // the gain is in small windows (many dead groups, a cheap lat_live); a multi-token verify window hits more groups and
+    // lat_live's per-layer cost can outweigh it, so skip it there (STRATA_METAL_LATENT_SKIP_MAXT, default 2)
+    static const bool lat_skip_on = std::getenv("STRATA_METAL_LATENT_SKIP") &&
+                                    std::string(std::getenv("STRATA_METAL_LATENT_SKIP")) == "1";
+    static const int lat_skip_maxt = [] { const char* e = std::getenv("STRATA_METAL_LATENT_SKIP_MAXT"); return e ? std::atoi(e) : 2; }();
+    const bool lat_skip = lat_skip_on && ntok <= lat_skip_maxt;
+    if (lat_skip) {
+        LatLiveArgs lv{(uint32_t) G, (uint32_t) ntok, (uint32_t) N, (uint32_t) MAXT, (uint32_t) ((N + 7) / 8), 0, 0, 0};
+        mtl::Dispatch d;
+        d.p = P(lib_, "lat_live", {}, "lat_live");
+        d.args = {mtl::Arg::B(plan_), mtl::Arg::B(lab_, (size_t) l * NEXP * 4), mtl::Arg::B(lyu_), mtl::Arg::B(ugrid_), mtl::Arg::V(lv)};
+        d.grid[0] = 1;
+        d.tg[0] = 256;
+        push(ds, d);
+    }
     for (int g = 0; g < G; ++g) {
         if (g) nb_ = true;   // the groups' GEMVs write disjoint rows
         lat_gemv(ds, lbase + dby + (size_t) g * N * urow, ELL, N, LZb_, plane, (size_t) g * MAXT, lyu_,
-                 (size_t) g * MAXT * N * 4, N, ntok);
+                 (size_t) g * MAXT * N * 4, N, ntok, lat_skip ? &ugrid_ : nullptr, (size_t) g * 3 * 4);
     }
     {
         GlueArgs ca{N, (uint32_t) ntok, N, (uint32_t) G};
