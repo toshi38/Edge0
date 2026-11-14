@@ -1,6 +1,8 @@
 // metal/tests/latent_parity.cpp - one latent MoE layer (Edge0 120B / 145B) on the Metal kernels against a CPU reference.
 //
-//   latent_parity [--pack DIR] [--layer L] [--ntok T] [--seed S]
+//   latent_parity [--pack DIR] [--layer L] [--ntok T] [--seed S] [--dtile L_R_S_K] [--utile L_R_S_K]
+//
+// --dtile / --utile name the GEMV tile of D and of U (gemv.metal: lanes a row, rows a lane, simdgroups, K split).
 //
 // The dispatches are the ones Window::latent_moe queues (metal/src/engine/window.cpp): D on gemv, lat_colscale, xprep,
 // the plan and lat_plan_rows, moe_gu / moe_down at the latent width, lat_group_sum, U on gemv a group.  The reference
@@ -43,15 +45,21 @@ int main(int argc, char** argv) {
     std::string pack;
     int layer = 0, ntok = 1, G = 8, ELL = 1792;
     uint64_t seed = 1;
+    std::string dtile = "16_1_4_1", utile = "16_1_4_1";   // the engine's (Window::lat_gemv)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--pack" && i + 1 < argc) pack = argv[++i];
         else if (a == "--layer" && i + 1 < argc) layer = std::atoi(argv[++i]);
         else if (a == "--ntok" && i + 1 < argc) ntok = std::atoi(argv[++i]);
         else if (a == "--seed" && i + 1 < argc) seed = (uint64_t) std::atoll(argv[++i]);
-        else { std::fprintf(stderr, "usage: latent_parity [--pack DIR] [--layer L] [--ntok T] [--seed S]\n"); return 2; }
+        else if (a == "--dtile" && i + 1 < argc) dtile = argv[++i];
+        else if (a == "--utile" && i + 1 < argc) utile = argv[++i];
+        else { std::fprintf(stderr, "usage: latent_parity [--pack DIR] [--layer L] [--ntok T] [--seed S] [--dtile L_R_S_K] [--utile L_R_S_K]\n"); return 2; }
     }
     if (ntok < 1 || ntok > MAXT || layer < 0 || layer > 47) return 2;
+    int dt[4], ut[4];
+    if (std::sscanf(dtile.c_str(), "%d_%d_%d_%d", &dt[0], &dt[1], &dt[2], &dt[3]) != 4 ||
+        std::sscanf(utile.c_str(), "%d_%d_%d_%d", &ut[0], &ut[1], &ut[2], &ut[3]) != 4) return 2;
     const size_t R = (size_t) MAXT * G, plane = 4 * R * ELL;
     const size_t drow = ref::row_bytes(ref::Q8_0, N), urow = ref::row_bytes(ref::Q8_0, ELL);
     const size_t dby = (size_t) G * ELL * drow, uby = (size_t) G * N * urow;
@@ -131,7 +139,8 @@ int main(int argc, char** argv) {
     const mtl::Pipeline pprep = cx.pipeline(lib, "xprep"), pplan = cx.pipeline(lib, "moe_plan"),
                         pcol = cx.pipeline(lib, "lat_colscale"), prow = cx.pipeline(lib, "lat_plan_rows"),
                         psum = cx.pipeline(lib, "lat_group_sum"),
-                        pgemv = cx.pipeline(lib, "gemv_8_16_1_4_1", mtl::Constants().i(0, ntok)),
+                        pgemv_d = cx.pipeline(lib, "gemv_8_" + dtile, mtl::Constants().i(0, ntok)),
+                        pgemv_u = cx.pipeline(lib, "gemv_8_" + utile, mtl::Constants().i(0, ntok)),
                         pgu = cx.pipeline(lib, "moe_gu_11_32_1_4"), pdn = cx.pipeline(lib, "moe_down_20_4_2_4");
     const LatArgs la{(uint32_t) ELL, (uint32_t) (ntok * G), (uint32_t) G, (uint32_t) MAXT, (uint32_t) ntok, 0, 0, 0};
     MoeArgs a{};
@@ -148,21 +157,22 @@ int main(int argc, char** argv) {
         d.grid[0] = (n / 16 * nt + 255) / 256;
         return d;
     };
-    auto gemv = [&](size_t w_off, int n_in, int n_out, const mtl::Buffer& xp, size_t pl, size_t row0, const mtl::Buffer& y,
-                    size_t y_off, size_t y_stride) {
+    auto gemv = [&](const mtl::Pipeline& pgemv, const int* tl, size_t w_off, int n_in, int n_out, const mtl::Buffer& xp, size_t pl,
+                    size_t row0, const mtl::Buffer& y, size_t y_off, size_t y_stride) {
         GemvArgs ga{(uint32_t) n_in, (uint32_t) n_out, (uint32_t) ntok, (uint32_t) ref::row_bytes(ref::Q8_0, n_in), (uint32_t) n_in,
                     (uint32_t) y_stride};
         mtl::Dispatch d;
         d.p = &pgemv;
         d.args = {mtl::Arg::B(LD, w_off), mtl::Arg::B(xp, row0 * (size_t) n_in * 4),
                   mtl::Arg::B(xp, pl * 4 + row0 * (size_t) (n_in / 16) * 4), mtl::Arg::B(y, y_off), mtl::Arg::V(ga)};
-        d.grid[0] = (n_out + 7) / 8;
-        d.tg[0] = 128;
+        const int rpt = (tl[2] / tl[3]) * (32 / tl[0]) * tl[1];   // rows a threadgroup
+        d.grid[0] = (uint32_t) ((n_out + rpt - 1) / rpt);
+        d.tg[0] = (uint32_t) (tl[2] * 32);
         return d;
     };
     std::vector<mtl::Dispatch> ds;
     ds.push_back(prep(bx, XF, N, MAXT));
-    ds.push_back(gemv(0, N, G * ELL, XF, (size_t) 4 * MAXT * N, 0, lxl, 0, (size_t) G * ELL));
+    ds.push_back(gemv(pgemv_d, dt, 0, N, G * ELL, XF, (size_t) 4 * MAXT * N, 0, lxl, 0, (size_t) G * ELL));
     {
         mtl::Dispatch d;
         d.p = &pcol;
@@ -211,13 +221,25 @@ int main(int argc, char** argv) {
     }
     ds.push_back(prep(lz, LZb, ELL, (uint32_t) R));
     for (int g = 0; g < G; ++g)
-        ds.push_back(gemv(dby + (size_t) g * N * urow, ELL, N, LZb, plane, (size_t) g * MAXT, lyu, (size_t) g * MAXT * N * 4, N));
+        ds.push_back(gemv(pgemv_u, ut, dby + (size_t) g * N * urow, ELL, N, LZb, plane, (size_t) g * MAXT, lyu, (size_t) g * MAXT * N * 4, N));
     cx.run(ds, 1, false, true);
     // the layer's time: the same dispatches repeated (warm weights), wall clock a repetition
     const auto t0 = std::chrono::steady_clock::now();
     const int reps = 20;
     cx.run(ds, reps, false, true);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+    // D alone and the U GEMVs alone (the same dispatches, on what the layer left in their inputs)
+    auto alone = [&](std::vector<mtl::Dispatch> v) {
+        const auto s0 = std::chrono::steady_clock::now();
+        cx.run(v, reps, false, true);
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count() / reps;
+    };
+    const double ms_d = alone({ds[1]}), ms_u = alone(std::vector<mtl::Dispatch>(ds.end() - G, ds.end()));
+    if (std::getenv("LP_VERBOSE")) {   // every stage alone
+        const char* names[] = {"xprep x", "D", "colscale", "xprep xl", "plan", "plan rows", "gate/up", "down", "group sum", "xprep z"};
+        for (size_t i = 0; i < 10; ++i) std::printf("  %-10s %.3f ms\n", names[i], alone({ds[i]}));
+    }
+    cx.run(ds, 1, false, true);   // the stages run alone left xl without its column scale: the layer again, for the check
     std::vector<float> got((size_t) ntok * N, 0.0f);
     for (int t = 0; t < ntok; ++t)
         for (int g = 0; g < G; ++g)
@@ -272,8 +294,8 @@ int main(int argc, char** argv) {
         mx = std::fmax(mx, std::fabs(d));
     }
     const double rel = std::sqrt(num / (den + 1e-30)), relx = std::sqrt(xl_gpu_err[0] / (xl_gpu_err[1] + 1e-30));
-    std::printf("xl   rel L2 %.3e\nout  rel L2 %.3e  max abs %.3e  (|out| rms %.3e)\nlayer %.2f ms for %d token(s): %.2f ms a token, %.0f ms a token over 48 layers\n", relx, rel, mx,
-                std::sqrt(den / want.size()), ms, ntok, ms / ntok, 48 * ms / ntok);
+    std::printf("xl   rel L2 %.3e\nout  rel L2 %.3e  max abs %.3e  (|out| rms %.3e)\nlayer %.2f ms for %d token(s) (D %.2f, U %.2f, the rest %.2f): %.2f ms a token, %.0f ms a token over 48 layers\n", relx, rel, mx,
+                std::sqrt(den / want.size()), ms, ntok, ms_d, ms_u, ms - ms_d - ms_u, ms / ntok, 48 * ms / ntok);
     const bool ok = rel < 2e-3 && relx < 1e-4 && den > 0;
     std::printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

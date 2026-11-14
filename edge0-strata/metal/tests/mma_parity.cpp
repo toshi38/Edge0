@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < n_in * MAXT; ++i) x.as<float>()[i] = r.sym();
                 std::vector<float> wf((size_t)n_in * n_out);
                 ref::dequant(t, W.ptr, wf.data(), wf.size());
-                for (int nt : {1, 3, 8}) {
+                for (int nt : {1, 2, 4, 8}) {
                     mtl::Pipeline p = cx.pipeline(lib, "gemv_mma_" + std::to_string(t) + "_2", mtl::Constants().i(4, nt));
                     MmaArgs a{(uint32_t)n_in, (uint32_t)n_out, (uint32_t)rb, (uint32_t)n_in, (uint32_t)n_out};
                     mtl::Dispatch d;
@@ -99,7 +99,10 @@ int main(int argc, char** argv) {
     const std::vector<Shape> shapes = {{"gdn qkv", ref::IQ4_XS, 2560, 10240}, {"gdn qkv", ref::Q3_K, 2560, 10240},
                                        {"gdn qkv", ref::Q4_K, 2560, 10240},   {"gdn qkv", ref::Q6_K, 2560, 10240},
                                        {"gdn out", ref::Q5_K, 6144, 2560},    {"qsa q", ref::Q2_0, 2560, 12288},
-                                       {"router", ref::BF16, 2560, 512},      {"lm head", ref::Q5_K, 2560, 248320}};
+                                       {"router", ref::BF16, 2560, 512},      {"lm head", ref::Q5_K, 2560, 248320},
+                                       {"latent D", ref::Q8_0, 2560, 14336},  {"latent U", ref::Q8_0, 1792, 2560},
+                                       {"latent D", ref::Q4_0, 2560, 14336},  {"latent U", ref::Q4_0, 1792, 2560},
+                                       {"gdn qkv", ref::Q8_0, 2560, 10240},   {"gdn gate", ref::Q8_0, 2560, 6144}};
     std::printf("%-9s %-7s %5s | %9s %9s | %s\n", "shape", "type", "ntok", "lane us", "mma us", "mma GB/s (best SG)");
     for (const Shape& s : shapes) {
         const size_t rb = ref::row_bytes(s.type, s.n_in), mb = rb * s.n_out;
@@ -123,7 +126,7 @@ int main(int argc, char** argv) {
             cx.run({d});
         }
         const size_t plane = (size_t)4 * s.n_in * MAXT;
-        for (int nt : {1, 3, 8}) {
+        for (int nt : {1, 2, 4, 8}) {
             auto time = [&](std::vector<mtl::Dispatch>& ds) {
                 cx.warm(ds, 0.1);
                 std::vector<double> t;

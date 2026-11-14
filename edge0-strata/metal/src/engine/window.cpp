@@ -95,6 +95,18 @@ constexpr int N = 2560, HC = 4, LR = 320, NFF = 640, TOPK = 10, NEXP = 512, MAXT
 constexpr int P_MAXE = 128, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_GSTART + P_MAXE + 4,
               P_EW = P_ETOK + P_MAXE, P_TOKENT = P_EW + P_MAXE, P_INTS = P_TOKENT + P_MAXE, P_IGU = 4, P_IDN = 8;
 struct GemvArgs { uint32_t n_in, n_out, n_tok, row_bytes, x_stride, y_stride; };
+struct MmaArgs { uint32_t n_in, n_out, row_bytes, x_stride, y_stride; };   // mma.metal
+// A Q8_0 GEMV of a window of `ntok` tokens on the matrix units (gemv_mma) instead of the per-lane kernel: its time does
+// not grow with the tokens, the per-lane kernel's does (mma_parity --bench, M4 Max, D 2560 -> 14336: per-lane 81 / 108 /
+// 251 / 538 us for 1 / 2 / 4 / 8 tokens, gemv_mma 155 to 167 us for any; U 1792 -> 2560: 15 / 25 / 50 / 99 against 28).
+// Only where it wins in the engine's own profile (STRATA_METAL_KPROF, 3-token windows): from 4 tokens on, and not for
+// the wide inputs (6144 -> 2560: 1.7 ms a window per-lane at 2 tokens, 4.3 on the matrix units at 3) or the small
+// outputs (2560 -> 640).  STRATA_METAL_MMA_MIN sets the token count (default 4; 0: never).  The sums run in another
+// order than the per-lane kernel's.
+bool mma_window(int type, int n_in, int n_out, int ntok) {
+    static const int mn = [] { const char* e = std::getenv("STRATA_METAL_MMA_MIN"); return e ? std::atoi(e) : 4; }();
+    return mn > 0 && ntok >= mn && type == ref::Q8_0 && n_in % 128 == 0 && n_in <= 2560 && n_out >= 2048;
+}
 struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; };
 struct MoeArgs {
     uint64_t gate_off, up_off, down_off, gu_stride, d_stride;
@@ -441,6 +453,7 @@ private:
     double tp_pre_ = 0, tp_rg_ = 0;
 public:
     ~Window();
+    void prof_report();
     void prof_add(bool draft, double ms) { Prof& x = draft ? dprof_ : cprof_; ++x.n; x.all += ms; }
 private:
     // the Q8_0 copies of the hyper-connection matrices (the default; STRATA_HC_Q8=0: the BF16 originals)
@@ -600,8 +613,8 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     }
     n_vocab_ = (int64_t) T("output.weight").shape[1];
     if (const gguf::Tensor* e0 = f_.find("blk.0.ffn_gate_exps.weight")) gyro_dense_ = e0->type >= 144;
-    lib_ = cx_->compile({"quant.metal", "units.metal", "moe.metal", "gemv.metal", "router.metal", "gr.metal", "gr2.metal",
-                         "glue.metal", "latent.metal"});
+    lib_ = cx_->compile({"quant.metal", "units.metal", "moe.metal", "gemv.metal", "mma.metal", "router.metal", "gr.metal",
+                         "gr2.metal", "glue.metal", "latent.metal"});
     rcounter_ = cx_->alloc(16);
     lgdn_ = cx_->compile({"gdn.metal"}, "#define NO_GGML_COMMON 1\n");
     lqsa_ = cx_->compile({"qsa.metal", "qsa2.metal"}, "#define NO_GGML_COMMON 1\n");
@@ -797,6 +810,17 @@ void Window::gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const A
             if (S == 8 && K == 1) S = 4;
             if (K == 1 || (L == 32 && K == 2)) Rr = 2;
         }
+    }
+    if (mma_window(ty, n_in, n_out, ntok)) {
+        const std::string fn = "gemv_mma_" + std::to_string(ty) + "_1";
+        MmaArgs a{(uint32_t) n_in, (uint32_t) n_out, (uint32_t) ref::row_bytes(ty, n_in), (uint32_t) n_in, (uint32_t) y_stride};
+        mtl::Dispatch d;
+        d.p = P(lib_, fn, mtl::Constants().i(4, ntok), fn + "#" + std::to_string(ntok));
+        d.args = {mtl::Arg::B(wb ? *wb : W_, t.offset), mtl::Arg::B(x.b, 0), mtl::Arg::B(y, y_off), mtl::Arg::V(a)};
+        d.grid[0] = (n_out + 7) / 8;
+        d.tg[0] = 32;
+        push(ds, d);
+        return;
     }
     const std::string fn = "gemv_" + std::to_string(ty) + "_" + std::to_string(L) + "_" + std::to_string(Rr) + "_" +
                            std::to_string(S) + "_" + std::to_string(K);
@@ -1318,6 +1342,17 @@ bool Window::latent_init(std::string& err) {
 void Window::lat_gemv(std::vector<mtl::Dispatch>& ds, size_t w_off, int n_in, int n_out, const mtl::Buffer& xp, size_t plane,
                       size_t row0, const mtl::Buffer& y, size_t y_off, size_t y_stride, int ntok) {
     const int ty = lat_fmt_ == 4 ? ref::Q4_0 : ref::Q8_0;
+    if (mma_window(ty, n_in, n_out, ntok)) {   // (the raw plane is the first: row0's rows and the 7 after it are in the buffer)
+        const std::string fn = "gemv_mma_" + std::to_string(ty) + "_1";
+        MmaArgs a{(uint32_t) n_in, (uint32_t) n_out, (uint32_t) ref::row_bytes(ty, n_in), (uint32_t) n_in, (uint32_t) y_stride};
+        mtl::Dispatch d;
+        d.p = P(lib_, fn, mtl::Constants().i(4, ntok), fn + "#" + std::to_string(ntok));
+        d.args = {mtl::Arg::B(LD_, w_off), mtl::Arg::B(xp, row0 * (size_t) n_in * 4), mtl::Arg::B(y, y_off), mtl::Arg::V(a)};
+        d.grid[0] = (n_out + 7) / 8;
+        d.tg[0] = 32;
+        push(ds, d);
+        return;
+    }
     const int L = 16, Rr = 1, S = 4, K = 1;
     const std::string fn = "gemv_" + std::to_string(ty) + "_" + std::to_string(L) + "_" + std::to_string(Rr) + "_" +
                            std::to_string(S) + "_" + std::to_string(K);
@@ -1917,8 +1952,8 @@ void Window::kprof(const std::vector<mtl::Dispatch>& ds, int Tn) {
     for (const auto& [m, c] : rows) std::fprintf(stderr, "strata metal kprof: %8.3f ms %5.1f%%  %s\n", m, 100.0 * m / sum, c.c_str());
 }
 
-Window::~Window() {
-    if (logpos_) std::fclose(logpos_);
+// STRATA_METAL_PROFILE=1: the window timings since the last report, then cleared
+void Window::prof_report() {
     if (std::getenv("STRATA_METAL_PROFILE") == nullptr) return;
     auto line = [](const char* what, const Prof& x) {
         if (x.n == 0) return;
@@ -1932,6 +1967,14 @@ Window::~Window() {
     }
     line("commit", cprof_);
     line("draft", dprof_);
+    prof_.clear();
+    cprof_ = Prof{};
+    dprof_ = Prof{};
+}
+
+Window::~Window() {
+    if (logpos_) std::fclose(logpos_);
+    prof_report();
 }
 
 bool Window::finish(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, double t0) {

@@ -526,6 +526,7 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
         const char* e = std::getenv("STRATA_METAL_PROMPT_CHUNK");
         return std::max(64, std::min(8192, e ? std::atoi(e) : lat_ ? 1024 : 2048));
     }();
+    prof_report();   // (STRATA_METAL_PROFILE: the decode windows since the last prompt)
     if (!pc_setup((int) std::min<int64_t>(C, std::max<int64_t>(n, 64)))) { err = "metal prompt: setup failed"; return false; }
     const double t0 = now_ms();
     pb_.gpu_ms = pb_.host_ms = pb_.mtp_ms = 0;
