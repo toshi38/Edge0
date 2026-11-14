@@ -102,6 +102,8 @@ The engine wires the whole pack once the GPU has used it: about 50 GB on the 145
 - Start each session with the upstream check in issue #8: if Edge0 has released its own macOS engine, compare with it before doing more.
 - Each piece of work is an issue. Before starting one, read it; when measuring something, put the numbers in a comment on it; tick its checkboxes as they are met.
 - A change that is not covered by an issue gets one first, even a short one.
+- Keep the board current. Close an issue as soon as its stated scope is delivered, with a comment summarising what shipped and the measurement; do not leave finished work open.
+- A new finding, follow-up, or adjacent idea gets its OWN new issue, not appended to an open one. Do not grow an existing issue's scope to absorb new work (no feature creep): the issue you close should be the issue you opened.
 - Commit messages name the issue (`refs #3`, `closes #1`).
 - Every claim of speed or correctness comes with the measurement and how it was taken. An estimate is labelled as one.
 
