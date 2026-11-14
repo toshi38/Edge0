@@ -83,6 +83,7 @@ Switches that matter here (all environment variables, set in the config's `env`)
 
 - `STRATA_METAL_PROMPT=window`: read prompts through 8-token decode windows instead of the prompt chain. `STRATA_METAL_PROMPT_CHUNK=N`: the chain's chunk rows (1024 for a latent pack). `STRATA_METAL_PROMPT_KEEP=1`: keep the chunk buffers between prompts.
 - `STRATA_METAL_KEEP_HOST_WEIGHTS=1`: keep the host code's device copies of the dense weights (unused on Metal, given back by default).
+- `STRATA_METAL_LATENT_WARM_GB=N`: read ahead D/U plus the hottest N GB of experts by profile rank, instead of all 40 GB (the memory/speed dial; experts are file-backed mmap and OS-streamed, so this sets how much file cache they fill). `STRATA_METAL_LATENT_SKIP=1`: skip the D/U GEMVs of latent groups no expert routed to (+8% single-token decode).
 - `STRATA_METAL_MMA_MIN=N`: the window size from which the large Q8_0 matrices run on the matrix units (4; 0 never).
 - `STRATA_METAL_PROFILE=1`: window timings by size, printed at each prompt. `STRATA_METAL_KPROF=T` (and `_EVERY=N`): the GPU time of every kernel class of a T-token window. `STRATA_METAL_ALLOC_LOG=1`: every allocation of 16 MB or more.
 
