@@ -20,6 +20,7 @@
 #include "strata/gpu/runtime.hpp"
 
 #include <sys/sysctl.h>
+#include <mach/mach.h>
 
 #include <atomic>
 #include <chrono>
@@ -484,12 +485,25 @@ Error device_synchronize() {
     (void) r;
 }
 Error mem_get_info(size_t* free_b, size_t* total_b) {
-    // the GPU's budget is the working set the OS grants this process; what is free is that minus what is allocated
-    MTL::Device* d = rt().dev;
-    const uint64_t budget = d->recommendedMaxWorkingSetSize();
-    const uint64_t used = d->currentAllocatedSize();
-    *total_b = (size_t) budget;
-    *free_b = (size_t) (used < budget ? budget - used : 0);
+    // Apple Silicon has one unified memory: there is no separate VRAM to run out of, and currentAllocatedSize counts
+    // the file-backed mmaps the engine wraps (the 40 GB expert pack) that are mostly not resident, so budget - used
+    // reads ~0 and triggers a discrete-GPU "VRAM almost full" warning that does not apply here.  Report the real
+    // system memory instead: total = physical RAM, free = what the OS can give without swapping (free, inactive,
+    // speculative, purgeable and clean file-cache pages).
+    uint64_t phys = 0;
+    size_t pl = sizeof phys;
+    sysctlbyname("hw.memsize", &phys, &pl, nullptr, 0);
+    *total_b = (size_t) (phys ? phys : rt().dev->recommendedMaxWorkingSetSize());
+    vm_statistics64_data_t vs{};
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &cnt) == KERN_SUCCESS) {
+        const uint64_t pg = vm_kernel_page_size;
+        *free_b = (size_t) ((vs.free_count + vs.inactive_count + vs.speculative_count + vs.purgeable_count +
+                             vs.external_page_count) * pg);
+    } else {
+        const uint64_t budget = rt().dev->recommendedMaxWorkingSetSize(), used = rt().dev->currentAllocatedSize();
+        *free_b = (size_t) (used < budget ? budget - used : 0);
+    }
     return kSuccess;
 }
 Error device_integrated(int* v, int) { *v = 1; return kSuccess; }
