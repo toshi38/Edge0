@@ -55,10 +55,11 @@ The chunk path multiplies fp16 operands, so its error is about 7e-4. Run it afte
   "exe": "<repo>/edge0-strata/build-metal/strata",
   "args": ["--pack", ".", "--native", "./model-skeleton.gguf", "--native-dense-gguf", "./model-skeleton.gguf",
            "--ple-gguf", "./ple-fp8.gguf", "--expert-profile", "./profile.bin", "--expert-cache", "64",
-           "--prefill", "auto", "--spec", "2", "--max-context", "32768", "--mmap-experts"],
+           "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "./mtp", "--max-context", "32768", "--mmap-experts"],
   "cwd": ".", "tokenizer": "./tokenizer", "log": "./serve-mac.log", "port": 8123, "lib_dirs": [],
   "env": {"STRATA_LATENT_DENSE": "./latent_dense_q8.bin", "STRATA_LATENT_DENSE_FMT": "8",
-          "STRATA_LATENT_A": "./experts.bin", "STRATA_LATENT_LABELS": "./labels.bin"}
+          "STRATA_LATENT_A": "./experts.bin", "STRATA_LATENT_LABELS": "./labels.bin",
+          "STRATA_METAL_MTP_GGUF": "./mtp-q2_0.gguf", "STRATA_METAL_DRAFT_VOCAB": "./mtp/draft_vocab.bin"}
 }
 ```
 
@@ -68,15 +69,31 @@ cd $MODEL_DIR
   --engine strata --config ./model-mac.json --port 8123 --host 127.0.0.1 --no-api-key --offline
 ```
 
-The Python environment is `uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt` in `edge0-strata/`. The server speaks the OpenAI chat API on `/v1/chat/completions`. A native pack needs `--spec` of 2 or more.
+The draft head (`--mtp`) needs the drafter as a GGUF, which the pack does not ship. Make it once:
+
+```sh
+.venv/bin/python tools/mtp_unrt.py --rt $MODEL_DIR/mtp --out $MODEL_DIR/mtp-q2_0.gguf
+```
+
+Without the draft head, drop `--mtp ./mtp`, `--spec-min-p 0.5` and the two `STRATA_METAL_MTP_*` / `_DRAFT_VOCAB` variables and use `--spec 2` (a native pack needs `--spec` of 2 or more).
+
+The Python environment is `uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt` in `edge0-strata/`. The server speaks the OpenAI chat API on `/v1/chat/completions`.
+
+Switches that matter here (all environment variables, set in the config's `env`):
+
+- `STRATA_METAL_PROMPT=window`: read prompts through 8-token decode windows instead of the prompt chain. `STRATA_METAL_PROMPT_CHUNK=N`: the chain's chunk rows (1024 for a latent pack). `STRATA_METAL_PROMPT_KEEP=1`: keep the chunk buffers between prompts.
+- `STRATA_METAL_KEEP_HOST_WEIGHTS=1`: keep the host code's device copies of the dense weights (unused on Metal, given back by default).
+- `STRATA_METAL_MMA_MIN=N`: the window size from which the large Q8_0 matrices run on the matrix units (4; 0 never).
+- `STRATA_METAL_PROFILE=1`: window timings by size, printed at each prompt. `STRATA_METAL_KPROF=T` (and `_EVERY=N`): the GPU time of every kernel class of a T-token window. `STRATA_METAL_ALLOC_LOG=1`: every allocation of 16 MB or more.
 
 ## Memory: read this before starting the engine
 
-The engine wires the whole pack once the GPU has used it: about 50 GB on the 145B q3k pack, and it cannot shrink under pressure. On a 64 GB Mac:
+The engine wires the whole pack once the GPU has used it: about 50 GB on the 145B q3k pack, and it cannot shrink under pressure. Beside that it holds about 3.5 GB of its own buffers, and 2.6 GB more while a long prompt is read. On a 64 GB Mac:
 
 - Check free memory first. If other programs hold more than about 15 GiB, the engine pushes them to swap and the machine crawls. Do not start it then; say so and stop.
 - One heavy job at a time. Never run the engine beside another model, a large build, or parallel agents that run things.
-- The read-ahead at start (`latent_warm`) reads the packs into the file cache when there is room, and prompts are fast after it (about 43 tok/s through decode windows). Without it, prompts page the experts in at about 0.4 GB/s. `STRATA_METAL_LATENT_WARM=1` forces it, `=0` turns it off.
+- The read-ahead at start (`latent_warm`) reads the packs into the file cache when there is room. Without it, the first prompts page the experts in at about 0.4 GB/s. `STRATA_METAL_LATENT_WARM=1` forces it, `=0` turns it off.
+- When speed swings for no visible reason, look at memory before the kernels: `vmmap --summary <engine pid>`, row `IOAccelerator (graphics)`, shows the engine's own buffers and how much of them macOS has compressed or swapped; `sysctl vm.swapusage` shows the swap.
 - Stop the server when a run is done: `pkill -f "serve/server.py --engine strata"`.
 
 ## How work is tracked
@@ -114,7 +131,9 @@ The same care applies to issues and comments, which no script checks: read them 
 
 ## Measured so far (M4 Max, 64 GB, 145B q3k)
 
-- Latent layer on Metal: 0.69 ms a layer for a 1-token window, 1.8 ms for 8 tokens.
-- Decode: 34 to 37 tok/s on short generations, 25 to 28 tok/s across a long eval run. No draft head yet.
-- Prompt: 43 to 54 tok/s through decode windows with the packs read ahead.
+- Prompt: 330 to 430 tok/s through the prompt chain from 2.5K to 32K tokens (a 32.3K-token prompt in 97 s). 100 tok/s through decode windows.
+- Decode, 300 tokens, thinking off: 37 to 39 tok/s with the draft head after a short prompt, 33 to 36 after 8.6K tokens; 35 and 33 without it. A one-token window is 28 to 30 ms of GPU time at any context length up to 28K, a four-token window 63 ms.
+- A one-token window's GPU time by kernel (`STRATA_METAL_KPROF=1`): the latent D and U GEMVs 10.3 ms of 27.9, the experts' gate/up and down 3.5 ms, the rest the dense projections.
+- Memory: 49.8 GB of wrapped files, 3.5 GB of the engine's own buffers resident.
+- Latent layer alone (`latent_parity`): 0.66 ms for a one-token window. A chunk's latent layer (`latent_chunk_parity`): 24 ms for 1024 rows.
 - Edge0's own figures for comparison: 60.9 tok/s decode and about 750 to 900 tok/s prompt on an M2 Ultra (unreleased Metal build), 99.7 tok/s decode on an RTX 5090 D.
