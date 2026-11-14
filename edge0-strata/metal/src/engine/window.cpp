@@ -100,12 +100,12 @@ struct MmaArgs { uint32_t n_in, n_out, row_bytes, x_stride, y_stride; };   // mm
 // not grow with the tokens, the per-lane kernel's does (mma_parity --bench, M4 Max, D 2560 -> 14336: per-lane 81 / 108 /
 // 251 / 538 us for 1 / 2 / 4 / 8 tokens, gemv_mma 155 to 167 us for any; U 1792 -> 2560: 15 / 25 / 50 / 99 against 28).
 // Q4_0 D: 49 / 114 / 268 / 522 us per-lane against 167 to 183.
-// Only where it wins in the engine's own profile (STRATA_METAL_KPROF, 3-token windows): from 4 tokens on, and not for
-// the wide inputs (6144 -> 2560: 1.7 ms a window per-lane at 2 tokens, 4.3 on the matrix units at 3) or the small
-// outputs (2560 -> 640).  STRATA_METAL_MMA_MIN sets the token count (default 4; 0: never).  The sums run in another
-// order than the per-lane kernel's.
+// Only where it wins in the engine's own profile (STRATA_METAL_KPROF, 3-token windows): not for the wide inputs
+// (6144 -> 2560: 1.7 ms a window per-lane at 2 tokens, 4.3 on the matrix units at 3) or the small outputs (2560 -> 640).
+// From 3 tokens on (STRATA_METAL_MMA_MIN; 0: never): with these shapes a 3-token window is 58.8 ms against 66.4 from 4
+// tokens on, after 8.6K tokens of context.  The sums run in another order than the per-lane kernel's.
 bool mma_window(int type, int n_in, int n_out, int ntok) {
-    static const int mn = [] { const char* e = std::getenv("STRATA_METAL_MMA_MIN"); return e ? std::atoi(e) : 4; }();
+    static const int mn = [] { const char* e = std::getenv("STRATA_METAL_MMA_MIN"); return e ? std::atoi(e) : 3; }();
     return mn > 0 && ntok >= mn && (type == ref::Q8_0 || type == ref::Q4_0) && n_in % 128 == 0 && n_in <= 2560 && n_out >= 2048;
 }
 struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; };
