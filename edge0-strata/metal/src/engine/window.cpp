@@ -1231,37 +1231,98 @@ static uint64_t cached_bytes(const void* map, size_t bytes) {
     for (char c : v) n += (c & MINCORE_INCORE) ? page : 0;
     return std::min<uint64_t>(n, bytes);
 }
+// The experts.bin is file-backed mmap: the OS keeps the routed experts resident (about 4 GB during generation) and
+// the rest in the reclaimable file cache.  Reading ahead fills that cache so a prompt does not fault experts in from
+// the SSD at ~0.4 GB/s.  D and U are read every token, so they are always read ahead.  The experts are read ahead by
+// profile rank (profile.bin beside the pack, hottest first) up to STRATA_METAL_LATENT_WARM_GB; unset reads them all.
+// STRATA_METAL_LATENT_WARM=0 reads nothing, =1 reads ahead even when the auto-check says memory is short.
+static std::vector<std::pair<int, int>> read_profile(const std::string& path, int nl, int nexp) {
+    std::vector<std::pair<int, int>> rank;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return rank;
+    char magic[4];
+    uint32_t h[5];
+    if (std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "STRP", 4) == 0 && std::fread(h, 4, 5, f) == 5) {
+        const uint32_t count = h[3];
+        for (uint32_t i = 0; i < count; ++i) {
+            uint16_t p[2];
+            if (std::fread(p, 2, 2, f) != 2) break;
+            if (p[0] < nl && p[1] < nexp) rank.push_back({p[0], p[1]});
+        }
+    }
+    std::fclose(f);
+    return rank;
+}
 static void latent_warm(const std::string& a_path, const void* a_map, size_t a_bytes, const std::string& d_path, const void* d_map,
-                        size_t d_bytes) {
+                        size_t d_bytes, size_t blob, int nexp) {
     const char* e = std::getenv("STRATA_METAL_LATENT_WARM");
     if (e && std::string(e) == "0") return;
-    if (!(e && std::string(e) == "1")) {
+    const bool force = e && std::string(e) == "1";
+    // the expert read-ahead budget in bytes (STRATA_METAL_LATENT_WARM_GB); no cap when unset
+    uint64_t a_budget = a_bytes;
+    bool capped = false;
+    if (const char* g = std::getenv("STRATA_METAL_LATENT_WARM_GB")) {
+        const double gb = std::atof(g);
+        if (gb >= 0) { a_budget = std::min<uint64_t>(a_bytes, (uint64_t) (gb * 1e9)); capped = true; }
+    }
+    if (!force) {
         vm_statistics64_data_t vs{};
         mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
         vm_size_t page = 16384;
         host_page_size(mach_host_self(), &page);
         if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &cnt) != KERN_SUCCESS) return;
         const uint64_t room = ((uint64_t) vs.free_count + vs.inactive_count + vs.speculative_count + vs.purgeable_count) * page;
-        const uint64_t missing = (uint64_t) a_bytes + d_bytes - cached_bytes(a_map, a_bytes) - cached_bytes(d_map, d_bytes);
+        const uint64_t missing = a_budget + d_bytes - std::min<uint64_t>(a_budget, cached_bytes(a_map, a_bytes)) -
+                                 cached_bytes(d_map, d_bytes);
         if (room < missing + (4ull << 30)) {
-            std::fprintf(stderr, "strata metal: latent packs not read ahead: %.1f GB of memory is free or reclaimable and %.1f GB of "
-                         "their %.1f GB is not in the file cache; prompts will read the experts from the SSD as they route to them "
-                         "(slow). Close other programs, or STRATA_METAL_LATENT_WARM=1 reads ahead anyway\n", room / 1e9,
-                         missing / 1e9, (a_bytes + d_bytes) / 1e9);
-            return;
+            if (!capped) {   // no budget set: keep the old all-or-nothing decline
+                std::fprintf(stderr, "strata metal: latent packs not read ahead: %.1f GB of memory is free or reclaimable and %.1f GB "
+                             "of their %.1f GB is not in the file cache; prompts will read the experts from the SSD as they route to "
+                             "them (slow). STRATA_METAL_LATENT_WARM_GB=N reads ahead N GB of the hottest experts, or "
+                             "STRATA_METAL_LATENT_WARM=1 reads all of them anyway\n", room / 1e9, missing / 1e9,
+                             (a_bytes + d_bytes) / 1e9);
+                return;
+            }
+            // a budget is set but does not fit: read what fits (D/U plus as many hot experts as the room allows)
+            const uint64_t fit = room > d_bytes + (4ull << 30) ? room - d_bytes - (4ull << 30) : 0;
+            a_budget = std::min<uint64_t>(a_budget, fit);
         }
     }
-    std::thread([a_path, d_path] {
+    const std::string prof = std::filesystem::path(a_path).parent_path().string() + "/profile.bin";
+    std::thread([a_path, d_path, a_budget, a_bytes, blob, nexp, prof] {
         const double t0 = now_ms();
         std::vector<char> buf((size_t) 16 << 20);
         uint64_t total = 0;
-        for (const std::string& p : {d_path, a_path}) {
-            const int fd = ::open(p.c_str(), O_RDONLY);
-            if (fd < 0) continue;
-            for (ssize_t n; (n = ::read(fd, buf.data(), buf.size())) > 0;) total += (uint64_t) n;
+        {   // D and U in full, sequentially
+            const int fd = ::open(d_path.c_str(), O_RDONLY);
+            if (fd >= 0) { for (ssize_t n; (n = ::read(fd, buf.data(), buf.size())) > 0;) total += (uint64_t) n; ::close(fd); }
+        }
+        const int fd = ::open(a_path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            if (a_budget >= a_bytes) {   // all experts, sequentially
+                for (ssize_t n; (n = ::read(fd, buf.data(), buf.size())) > 0;) total += (uint64_t) n;
+            } else if (a_budget > 0) {   // the hottest experts by profile rank, up to the budget
+                const auto rank = read_profile(prof, 48, nexp);
+                uint64_t want = a_budget;
+                auto read_blob = [&](int l, int ee) {
+                    const uint64_t off = ((uint64_t) l * nexp + ee) * blob;
+                    for (uint64_t got = 0; got < blob;) {
+                        const ssize_t n = ::pread(fd, buf.data(), std::min<uint64_t>(buf.size(), blob - got), (off_t) (off + got));
+                        if (n <= 0) break;
+                        got += (uint64_t) n; total += (uint64_t) n;
+                    }
+                };
+                if (!rank.empty()) {
+                    for (const auto& [l, ee] : rank) { if (want < blob) break; read_blob(l, ee); want -= blob; }
+                } else {   // no profile: layer 0 upward until the budget
+                    for (int l = 0; l < 48 && want >= blob; ++l)
+                        for (int ee = 0; ee < nexp && want >= blob; ++ee) { read_blob(l, ee); want -= blob; }
+                }
+            }
             ::close(fd);
         }
-        std::fprintf(stderr, "strata metal: latent packs read ahead: %.1f GB in %.1f s\n", total / 1e9, (now_ms() - t0) / 1e3);
+        std::fprintf(stderr, "strata metal: latent packs read ahead: %.1f GB in %.1f s%s\n", total / 1e9, (now_ms() - t0) / 1e3,
+                     a_budget < a_bytes ? " (experts capped by STRATA_METAL_LATENT_WARM_GB; the rest fault from the SSD on first use)" : "");
     }).detach();
 }
 
@@ -1309,7 +1370,7 @@ bool Window::latent_init(std::string& err) {
         return false;
     }
     lat_G_ = G; lat_ELL_ = ELL; lat_I_ = I; lat_blob_ = blob;
-    latent_warm(ea, lat_a_map_, a_bytes, ed, lat_d_map_, d_bytes);
+    latent_warm(ea, lat_a_map_, a_bytes, ed, lat_d_map_, d_bytes, blob, NEXP);
     LA_ = cx_->wrap(lat_a_map_, a_bytes, (size_t) NEXP * blob);
     LD_ = cx_->wrap(lat_d_map_, d_bytes, per_layer);
     if (LA_.handle == nullptr || LD_.handle == nullptr) { err = "metal latent: cannot wrap the latent packs as Metal buffers"; return false; }
