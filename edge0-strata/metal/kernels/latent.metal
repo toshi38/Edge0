@@ -58,15 +58,16 @@ kernel void lat_group_sum(device const float* ye [[buffer(0)]], device const int
 struct LatLiveArgs {
     uint g;        // groups
     uint n_tok;
-    uint n_out;    // U output width (the model width N): lyu row length and the live grid's gx numerator
+    uint n_out;    // U output width (the model width N): lyu row length
     uint maxt;     // lyu row stride between groups
-    uint ug_gx;    // the U GEMV's threadgroup count for a live group (host passes ceil(n_out / rpt))
-    uint pad0, pad1, pad2;
+    uint ug_gx;    // the U GEMV's threadgroup count for a live group
+    uint dg_gx;    // the D GEMV's threadgroup count for a live group (0 if the D skip is off: dgrid left untouched)
+    uint pad0, pad1;
 };
 kernel void lat_live(device const int* plan [[buffer(0)]], device const int* labels [[buffer(1)]],
                      device float* lyu [[buffer(2)]], device uint* ugrid [[buffer(3)]],
-                     constant LatLiveArgs& a [[buffer(4)]], uint tid [[thread_position_in_threadgroup]],
-                     uint nt [[threads_per_threadgroup]]) {
+                     constant LatLiveArgs& a [[buffer(4)]], device uint* dgrid [[buffer(5)]],
+                     uint tid [[thread_position_in_threadgroup]], uint nt [[threads_per_threadgroup]]) {
     threadgroup atomic_uint live[16];
     for (uint g = tid; g < a.g; g += nt) atomic_store_explicit(&live[g], 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -83,6 +84,11 @@ kernel void lat_live(device const int* plan [[buffer(0)]], device const int* lab
         ugrid[g * 3 + 0] = lv ? a.ug_gx : 0u;
         ugrid[g * 3 + 1] = 1u;
         ugrid[g * 3 + 2] = 1u;
+        if (a.dg_gx) {   // the D skip: a dead group's xl is never read (no expert routes to it), so no zeroing needed
+            dgrid[g * 3 + 0] = lv ? a.dg_gx : 0u;
+            dgrid[g * 3 + 1] = 1u;
+            dgrid[g * 3 + 2] = 1u;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // zero the dead groups' lyu rows for the live tokens (what moe_combine_sh reads)

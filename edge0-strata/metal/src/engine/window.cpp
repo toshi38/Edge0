@@ -315,7 +315,7 @@ private:
     int lat_G_ = 0, lat_ELL_ = 0, lat_I_ = 0, lat_fmt_ = 8;
     size_t lat_blob_ = 0;
     void *lat_a_map_ = nullptr, *lat_d_map_ = nullptr;
-    mtl::Buffer LA_, LD_, lab_, linv_, lxl_, lz_, lyu_, uplan_, LXb_, LZb_, ugrid_;
+    mtl::Buffer LA_, LD_, lab_, linv_, lxl_, lz_, lyu_, uplan_, LXb_, LZb_, ugrid_, dgrid_;
     bool latent_init(std::string& err);
     void latent_moe(std::vector<mtl::Dispatch>& ds, int l, int ntok, const std::string& b);
     void lat_gemv(std::vector<mtl::Dispatch>& ds, size_t w_off, int n_in, int n_out, const mtl::Buffer& xp, size_t plane,
@@ -1342,6 +1342,7 @@ bool Window::latent_init(std::string& err) {
     LZb_ = A(4 * (4 * R * ELL + R * ELL / 16));
     uplan_ = A(4 * P_INTS);   // moe_combine_sh's entry of (token, k): here k is the group, its row in lyu_ is g * MAXT + t
     ugrid_ = A(4 * (size_t) LAT_MAXG * 3);   // lat_live: the U GEMV's indirect grid a group (0 for a dead group)
+    dgrid_ = A(4 * (size_t) LAT_MAXG * 3);   // lat_live: the D GEMV's indirect grid a group
     for (int t = 0; t < MAXT; ++t)
         for (int g = 0; g < G; ++g) uplan_.as<int32_t>()[P_TOKENT + t * G + g] = g * MAXT + t;
     // The window reads the model from the wrapped files; the device copies of the dense weights the shared host code
@@ -1406,18 +1407,16 @@ void Window::latent_moe(std::vector<mtl::Dispatch>& ds, int l, int ntok, const s
         d.grid[0] = (uint32_t) ((ELL / 16 * R + 255) / 256);
         push(ds, d);
     };
-    // D: xl[t][g] = D_g . x[t], scaled by the pack's 1 / s, prepared for the experts
-    lat_gemv(ds, lbase, N, G * ELL, XF_.b, XF_.plane_bytes(), 0, lxl_, 0, (size_t) G * ELL, ntok);
-    {
-        mtl::Dispatch d;
-        d.p = P(lib_, "lat_colscale", {}, "lat_colscale");
-        d.args = {mtl::Arg::B(lxl_), mtl::Arg::B(linv_, (size_t) l * ELL * 4), mtl::Arg::V(la)};
-        d.tg[0] = 256;
-        d.grid[0] = (uint32_t) ((ntok * G * ELL + 255) / 256);
-        push(ds, d);
-    }
-    xprep_rows(lxl_, LXb_);
-    // the route and its plan; the plan's rows then name each entry's xl row
+    // The route runs before D so a group with no routed expert can skip its D and U GEMVs.  lat_live marks the live
+    // groups from the plan and writes each group's D/U indirect grid (0 for a dead group: the dispatch reads no
+    // weights).  A dead group's xl is never read (no expert routes to it) so D needs no clearing; its lyu is zeroed for
+    // the combine.  The base path (flag off) is byte-for-byte unchanged.  STRATA_METAL_LATENT_SKIP=1, windows up to
+    // STRATA_METAL_LATENT_SKIP_MAXT tokens (default 2): a multi-token verify window hits more groups and lat_live's
+    // per-layer cost can outweigh the saving.
+    static const bool lat_skip_on = std::getenv("STRATA_METAL_LATENT_SKIP") &&
+                                    std::string(std::getenv("STRATA_METAL_LATENT_SKIP")) == "1";
+    static const int lat_skip_maxt = [] { const char* e = std::getenv("STRATA_METAL_LATENT_SKIP_MAXT"); return e ? std::atoi(e) : 2; }();
+    const bool lat_skip = lat_skip_on && ntok <= lat_skip_maxt;
     MoeArgs a{};
     a.gu_row = (uint32_t) ref::row_bytes(ref::Q3_K, ELL);
     a.d_row = (uint32_t) ref::row_bytes(ref::IQ4_NL, I);
@@ -1441,6 +1440,37 @@ void Window::latent_moe(std::vector<mtl::Dispatch>& ds, int l, int ntok, const s
         pr.tg[0] = P_MAXE;
         push(ds, pr);
     }
+    if (lat_skip) {
+        LatLiveArgs lv{(uint32_t) G, (uint32_t) ntok, (uint32_t) N, (uint32_t) MAXT, (uint32_t) ((N + 7) / 8),
+                       (uint32_t) ((ELL + 7) / 8), 0, 0};
+        mtl::Dispatch d;
+        d.p = P(lib_, "lat_live", {}, "lat_live");
+        d.args = {mtl::Arg::B(plan_), mtl::Arg::B(lab_, (size_t) l * NEXP * 4), mtl::Arg::B(lyu_), mtl::Arg::B(ugrid_),
+                  mtl::Arg::V(lv), mtl::Arg::B(dgrid_)};
+        d.grid[0] = 1;
+        d.tg[0] = 256;
+        push(ds, d);
+    }
+    // D: xl[t][g] = D_g . x[t], scaled by the pack's 1 / s, prepared for the experts
+    if (lat_skip) {
+        const int dty = lat_fmt_ == 4 ? ref::Q4_0 : ref::Q8_0;
+        for (int g = 0; g < G; ++g) {
+            if (g) nb_ = true;   // the groups' GEMVs write disjoint xl rows
+            lat_gemv(ds, lbase + (size_t) g * ELL * ref::row_bytes(dty, N), N, ELL, XF_.b, XF_.plane_bytes(), 0, lxl_,
+                     (size_t) g * ELL * 4, (size_t) G * ELL, ntok, &dgrid_, (size_t) g * 3 * 4);
+        }
+    } else {
+        lat_gemv(ds, lbase, N, G * ELL, XF_.b, XF_.plane_bytes(), 0, lxl_, 0, (size_t) G * ELL, ntok);
+    }
+    {
+        mtl::Dispatch d;
+        d.p = P(lib_, "lat_colscale", {}, "lat_colscale");
+        d.args = {mtl::Arg::B(lxl_), mtl::Arg::B(linv_, (size_t) l * ELL * 4), mtl::Arg::V(la)};
+        d.tg[0] = 256;
+        d.grid[0] = (uint32_t) ((ntok * G * ELL + 255) / 256);
+        push(ds, d);
+    }
+    xprep_rows(lxl_, LXb_);
     {
         GlueArgs ga{NFF, MAXT, N, TOPK};
         mtl::Dispatch d;
@@ -1489,24 +1519,6 @@ void Window::latent_moe(std::vector<mtl::Dispatch>& ds, int l, int ntok, const s
         push(ds, d);
     }
     xprep_rows(lz_, LZb_);
-    // Skip the U GEMV of a latent group no routed expert uses (about a third of the 8 at one token on the 145B pack):
-    // lat_live writes each group's indirect grid (0 for a dead group) and zeros the dead groups' lyu rows, which z=0
-    // would make zero anyway.  Off by default; the base path is byte-for-byte unchanged.  STRATA_METAL_LATENT_SKIP=1.
-    // the gain is in small windows (many dead groups, a cheap lat_live); a multi-token verify window hits more groups and
-    // lat_live's per-layer cost can outweigh it, so skip it there (STRATA_METAL_LATENT_SKIP_MAXT, default 2)
-    static const bool lat_skip_on = std::getenv("STRATA_METAL_LATENT_SKIP") &&
-                                    std::string(std::getenv("STRATA_METAL_LATENT_SKIP")) == "1";
-    static const int lat_skip_maxt = [] { const char* e = std::getenv("STRATA_METAL_LATENT_SKIP_MAXT"); return e ? std::atoi(e) : 2; }();
-    const bool lat_skip = lat_skip_on && ntok <= lat_skip_maxt;
-    if (lat_skip) {
-        LatLiveArgs lv{(uint32_t) G, (uint32_t) ntok, (uint32_t) N, (uint32_t) MAXT, (uint32_t) ((N + 7) / 8), 0, 0, 0};
-        mtl::Dispatch d;
-        d.p = P(lib_, "lat_live", {}, "lat_live");
-        d.args = {mtl::Arg::B(plan_), mtl::Arg::B(lab_, (size_t) l * NEXP * 4), mtl::Arg::B(lyu_), mtl::Arg::B(ugrid_), mtl::Arg::V(lv)};
-        d.grid[0] = 1;
-        d.tg[0] = 256;
-        push(ds, d);
-    }
     for (int g = 0; g < G; ++g) {
         if (g) nb_ = true;   // the groups' GEMVs write disjoint rows
         lat_gemv(ds, lbase + dby + (size_t) g * N * urow, ELL, N, LZb_, plane, (size_t) g * MAXT, lyu_,
