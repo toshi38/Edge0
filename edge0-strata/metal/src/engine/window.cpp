@@ -96,16 +96,17 @@ constexpr int P_MAXE = 128, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_
               P_EW = P_ETOK + P_MAXE, P_TOKENT = P_EW + P_MAXE, P_INTS = P_TOKENT + P_MAXE, P_IGU = 4, P_IDN = 8;
 struct GemvArgs { uint32_t n_in, n_out, n_tok, row_bytes, x_stride, y_stride; };
 struct MmaArgs { uint32_t n_in, n_out, row_bytes, x_stride, y_stride; };   // mma.metal
-// A Q8_0 GEMV of a window of `ntok` tokens on the matrix units (gemv_mma) instead of the per-lane kernel: its time does
+// A Q8_0 or Q4_0 GEMV of a window of `ntok` tokens on the matrix units (gemv_mma) instead of the per-lane kernel: its time does
 // not grow with the tokens, the per-lane kernel's does (mma_parity --bench, M4 Max, D 2560 -> 14336: per-lane 81 / 108 /
 // 251 / 538 us for 1 / 2 / 4 / 8 tokens, gemv_mma 155 to 167 us for any; U 1792 -> 2560: 15 / 25 / 50 / 99 against 28).
+// Q4_0 D: 49 / 114 / 268 / 522 us per-lane against 167 to 183.
 // Only where it wins in the engine's own profile (STRATA_METAL_KPROF, 3-token windows): from 4 tokens on, and not for
 // the wide inputs (6144 -> 2560: 1.7 ms a window per-lane at 2 tokens, 4.3 on the matrix units at 3) or the small
 // outputs (2560 -> 640).  STRATA_METAL_MMA_MIN sets the token count (default 4; 0: never).  The sums run in another
 // order than the per-lane kernel's.
 bool mma_window(int type, int n_in, int n_out, int ntok) {
     static const int mn = [] { const char* e = std::getenv("STRATA_METAL_MMA_MIN"); return e ? std::atoi(e) : 4; }();
-    return mn > 0 && ntok >= mn && type == ref::Q8_0 && n_in % 128 == 0 && n_in <= 2560 && n_out >= 2048;
+    return mn > 0 && ntok >= mn && (type == ref::Q8_0 || type == ref::Q4_0) && n_in % 128 == 0 && n_in <= 2560 && n_out >= 2048;
 }
 struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; };
 struct MoeArgs {
@@ -1211,10 +1212,19 @@ void* map_whole(const std::string& path, size_t& bytes, std::string& err) {
 // Reads the experts' pack and the D/U pack through once, in order, on a thread of its own, so their pages are in the
 // file cache before a prompt needs them: a prompt window of 8 tokens reads up to 80 experts a layer (6 GB over the 48
 // layers), and a page fault at a time from the GPU that is about 0.4 GB/s where a sequential read is several GB/s.
-// Only when the memory has room for both files beside what is in use (free + inactive + speculative + purgeable pages,
-// 4 GiB kept back): on a Mac that is short the read would push other programs into swap, and the pages would not stay.
-// STRATA_METAL_LATENT_WARM=0 never reads ahead, =1 always does.
-static void latent_warm(const std::string& a_path, size_t a_bytes, const std::string& d_path, size_t d_bytes) {
+// Only when the memory has room for what of the two files is not in the file cache yet (mincore) beside what is in use
+// (free + inactive + speculative + purgeable pages, 4 GiB kept back): on a Mac that is short the read would push other
+// programs into swap, and the pages would not stay.  STRATA_METAL_LATENT_WARM=0 never reads ahead, =1 always does.
+static uint64_t cached_bytes(const void* map, size_t bytes) {
+    const size_t page = 16384;
+    std::vector<char> v((bytes + page - 1) / page);
+    if (mincore(map, bytes, v.data()) != 0) return 0;
+    uint64_t n = 0;
+    for (char c : v) n += (c & MINCORE_INCORE) ? page : 0;
+    return std::min<uint64_t>(n, bytes);
+}
+static void latent_warm(const std::string& a_path, const void* a_map, size_t a_bytes, const std::string& d_path, const void* d_map,
+                        size_t d_bytes) {
     const char* e = std::getenv("STRATA_METAL_LATENT_WARM");
     if (e && std::string(e) == "0") return;
     if (!(e && std::string(e) == "1")) {
@@ -1224,10 +1234,12 @@ static void latent_warm(const std::string& a_path, size_t a_bytes, const std::st
         host_page_size(mach_host_self(), &page);
         if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &cnt) != KERN_SUCCESS) return;
         const uint64_t room = ((uint64_t) vs.free_count + vs.inactive_count + vs.speculative_count + vs.purgeable_count) * page;
-        if (room < (uint64_t) a_bytes + d_bytes + (4ull << 30)) {
-            std::fprintf(stderr, "strata metal: latent packs not read ahead: %.1f GB of memory is free or reclaimable and they are %.1f GB; "
-                         "prompts will read the experts from the SSD as they route to them (slow). Close other programs, or "
-                         "STRATA_METAL_LATENT_WARM=1 reads ahead anyway\n", room / 1e9, (a_bytes + d_bytes) / 1e9);
+        const uint64_t missing = (uint64_t) a_bytes + d_bytes - cached_bytes(a_map, a_bytes) - cached_bytes(d_map, d_bytes);
+        if (room < missing + (4ull << 30)) {
+            std::fprintf(stderr, "strata metal: latent packs not read ahead: %.1f GB of memory is free or reclaimable and %.1f GB of "
+                         "their %.1f GB is not in the file cache; prompts will read the experts from the SSD as they route to them "
+                         "(slow). Close other programs, or STRATA_METAL_LATENT_WARM=1 reads ahead anyway\n", room / 1e9,
+                         missing / 1e9, (a_bytes + d_bytes) / 1e9);
             return;
         }
     }
@@ -1289,7 +1301,7 @@ bool Window::latent_init(std::string& err) {
         return false;
     }
     lat_G_ = G; lat_ELL_ = ELL; lat_I_ = I; lat_blob_ = blob;
-    latent_warm(ea, a_bytes, ed, d_bytes);
+    latent_warm(ea, lat_a_map_, a_bytes, ed, lat_d_map_, d_bytes);
     LA_ = cx_->wrap(lat_a_map_, a_bytes, (size_t) NEXP * blob);
     LD_ = cx_->wrap(lat_d_map_, d_bytes, per_layer);
     if (LA_.handle == nullptr || LD_.handle == nullptr) { err = "metal latent: cannot wrap the latent packs as Metal buffers"; return false; }
