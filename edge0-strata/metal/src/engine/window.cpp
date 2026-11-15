@@ -99,13 +99,15 @@ struct GemvArgs { uint32_t n_in, n_out, n_tok, row_bytes, x_stride, y_stride; };
 struct MmaArgs { uint32_t n_in, n_out, row_bytes, x_stride, y_stride; };   // mma.metal
 // A Q8_0 or Q4_0 GEMV of a window of `ntok` tokens on the matrix units (gemv_mma) instead of the per-lane kernel: the
 // per-lane kernel's time grows with the tokens, gemv_mma's does not (mma_parity --bench, M4 Max, Q4_0 D 2560 -> 14336:
-// per-lane 49 / 114 / 268 / 522 us for 1 / 2 / 4 / 8 tokens, gemv_mma 167 to 183 us for any).  Only for the shapes where
-// it wins in a window's profile (STRATA_METAL_KPROF): inputs of at most 2560 and outputs of at least 2048, not the wide
-// inputs (6144 -> 2560) or the small outputs (2560 -> 640).  From 3 tokens on (STRATA_METAL_MMA_MIN; 0: never).  The
-// sums run in another order than the per-lane kernel's.
+// per-lane 49 / 114 / 268 / 522 us for 1 / 2 / 4 / 8 tokens, gemv_mma 167 to 183 us for any).
+// Only for the shapes where it wins in a window's own profile (STRATA_METAL_KPROF, M4 Max, 145B, 3 tokens): the latent D
+// (2560 -> 14336: 11.3 -> 8.0 ms over 48 layers), attn_qkv (2560 -> 10240: 6.2 -> 4.4) and attn_q (2560 -> 12288:
+// 2.6 -> 1.6).  It loses on attn_gate (2560 -> 6144: 2.0 -> 2.9), the output head (2560 -> vocabulary: 1.7 -> 2.3) and
+// the narrow inputs (640 -> 2560), which stay on the per-lane kernel.  From 3 tokens on (STRATA_METAL_MMA_MIN; 0:
+// never): at 2 tokens the per-lane kernel is still ahead.  The sums run in another order than the per-lane kernel's.
 bool mma_window(int type, int n_in, int n_out, int ntok) {
     static const int mn = [] { const char* e = std::getenv("STRATA_METAL_MMA_MIN"); return e ? std::atoi(e) : 3; }();
-    return mn > 0 && ntok >= mn && (type == ref::Q8_0 || type == ref::Q4_0) && n_in % 128 == 0 && n_in <= 2560 && n_out >= 2048;
+    return mn > 0 && ntok >= mn && (type == ref::Q8_0 || type == ref::Q4_0) && n_in == 2560 && n_out >= 10240 && n_out <= 16384;
 }
 struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; };
 struct MoeArgs {
