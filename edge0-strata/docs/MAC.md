@@ -249,6 +249,7 @@ For testing. All are off unless set; the defaults are described above.
 | `STRATA_HC_Q8=0` | The BF16 hyper-connection read (exact) instead of Q8_0 |
 | `STRATA_METAL_PROMPT=window` | Read the prompt through decode windows (slow, exact fallback; about 190 tok/s) |
 | `STRATA_METAL_PROMPT_CHUNK=N` | Prompt chunk size (default 2048 resident; see streaming above). On a latent pack (Edge0 145B, 120B) a Mac with less than 96 GB reads at most 2048 rows a chunk |
+| `STRATA_METAL_PROMPT_WARM=0` | Latent packs: do not read a chunk of tokens once at start; the first prompt then pays for the first uses. `STRATA_METAL_PROMPT_WARM_ROWS=N` sets its rows (1024) |
 | `STRATA_METAL_PROMPT_KEEP=1` | Latent packs: keep the prompt chain's chunk buffers as they are between prompts, instead of lending them to the OS |
 | `STRATA_METAL_MTP_Q8=0` | The draft layer's matrices in BF16 instead of Q8_0 |
 | `STRATA_METAL_MTP_CHAIN=0` | One GPU submission per draft step instead of one per round |

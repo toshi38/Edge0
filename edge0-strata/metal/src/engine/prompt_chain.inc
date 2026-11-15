@@ -312,7 +312,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
                mtl::Arg::B(ksc_[(size_t) qi]), mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(tail_[(size_t) qi]),
                mtl::Arg::B(dead_[(size_t) qi]), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::V(a), mtl::Arg::B(mrope_)},
               33, nT, 256);
-            if (pos0 + nT > PC_QB) {   // some row's context is past the budget: the indexer selects
+            if (pc_dry_ || pos0 + nT > PC_QB) {   // some row's context is past the budget: the indexer selects
                 if (qsa_mm)
                     D(P_(b.lqsa, "qsa_score_mm"), {mtl::Arg::B(b.qidx), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::B(dead_[(size_t) qi]),
                                                  mtl::Arg::B(b.scores), mtl::Arg::V(a)},
@@ -587,6 +587,39 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
     static const bool keep = [] { const char* e = std::getenv("STRATA_METAL_PROMPT_KEEP"); return e && std::atoi(e) == 1; }();
     if (latent_on_ && !keep) pc_idle(true);
     return true;
+}
+
+// The prompt chain run once at start on a latent pack, so that the first prompt does not pay for first uses: creating
+// the chain's pipeline states, the GPU's first mapping of the chunk buffers, and the first GPU use of the wrapped
+// expert and D/U files.  A chunk of varied tokens is read through prompt() and the window is put back as it was:
+// reset() clears the running state the chunk wrote, the history index and the PLE token window are restored, and the
+// KV cells it filled are written again by the first real prompt before anything reads them.
+// STRATA_METAL_PROMPT_WARM=0 leaves all of it to the first prompt; STRATA_METAL_PROMPT_WARM_ROWS sets the rows (1024).
+void Window::prompt_warm() {
+    const char* e = std::getenv("STRATA_METAL_PROMPT_WARM");
+    const char* m = std::getenv("STRATA_METAL_PROMPT");
+    const char* lp = std::getenv("STRATA_METAL_LATENT_PROMPT");
+    if (!latent_on_ || stream_ || pend_fold_ > 0 || (e && std::string(e) == "0") || (m && std::string(m) == "window") ||
+        !(lp && std::string(lp) == "1"))
+        return;
+    const double t0 = now_ms();
+    const char* r = std::getenv("STRATA_METAL_PROMPT_WARM_ROWS");
+    const int rows = (int) std::min<int64_t>(std::max(128, std::min(2048, r ? std::atoi(r) : 1024)), max_cells_ - 2);
+    std::vector<int64_t> tk((size_t) rows);
+    uint64_t x = 0x9E3779B97F4A7C15ull;   // varied tokens, so that the chunk routes to (and the GPU maps) most experts
+    for (auto& t : tk) { x = x * 6364136223846793005ull + 1442695040888963407ull; t = (int64_t) ((x >> 33) % (uint64_t) n_vocab_); }
+    std::string err;
+    const int hp = hp_;
+    const int32_t prev[2] = {ss_->ple_prev[0], ss_->ple_prev[1]};
+    pc_dry_ = true;   // (also takes the indexer's selection kernels, which a first chunk at position 0 would not)
+    const bool ok = prompt(tk.data(), rows, 0, nullptr, err);
+    pc_dry_ = false;
+    reset();
+    hp_ = hp;
+    ss_->ple_prev[0] = prev[0];
+    ss_->ple_prev[1] = prev[1];
+    std::fprintf(stderr, "strata metal: prompt chain run once at start (%d rows) in %.0f ms%s\n", rows, now_ms() - t0,
+                 ok ? "" : (" (failed: " + err + ")").c_str());
 }
 
 // Between prompts the chunk buffers are kept but lent to the OS: volatile buffers can be discarded under memory pressure
