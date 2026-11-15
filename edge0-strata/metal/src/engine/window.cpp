@@ -486,6 +486,10 @@ private:
     }
     Act XEn_, XHn_;
     PromptBufs pb_;
+    bool pc_dry_ = false;   // prompt_warm's chunk: every kernel a chunk can use is queued
+public:
+    void prompt_warm();
+private:
     mtl::Buffer mpemb_;                    // the drafter's prompt embedding rows (mtp_prefill, one command buffer)
     size_t mpemb_rows_ = 0;
     const mtl::Buffer* membp_ = nullptr;   // mtp_encode's embedding rows (nullptr: memb_)
@@ -3170,6 +3174,7 @@ bool window_init(void* w, const strata::core::ModelGeometry& g, strata::core::Se
         if (!x->init(g, ss, g_shard1, MAXT, max_cells, err)) return false;
         window_register(w);
         if (!mtp_load_pending(x, err)) return false;
+        x->prompt_warm();
     }
     x->set_max_t(max_t);
     *n_vocab = x->vocab();
