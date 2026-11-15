@@ -96,6 +96,17 @@ constexpr int N = 2560, HC = 4, LR = 320, NFF = 640, TOPK = 10, NEXP = 512, MAXT
 constexpr int P_MAXE = 128, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_GSTART + P_MAXE + 4,
               P_EW = P_ETOK + P_MAXE, P_TOKENT = P_EW + P_MAXE, P_INTS = P_TOKENT + P_MAXE, P_IGU = 4, P_IDN = 8;
 struct GemvArgs { uint32_t n_in, n_out, n_tok, row_bytes, x_stride, y_stride; };
+struct MmaArgs { uint32_t n_in, n_out, row_bytes, x_stride, y_stride; };   // mma.metal
+// A Q8_0 or Q4_0 GEMV of a window of `ntok` tokens on the matrix units (gemv_mma) instead of the per-lane kernel: the
+// per-lane kernel's time grows with the tokens, gemv_mma's does not (mma_parity --bench, M4 Max, Q4_0 D 2560 -> 14336:
+// per-lane 49 / 114 / 268 / 522 us for 1 / 2 / 4 / 8 tokens, gemv_mma 167 to 183 us for any).  Only for the shapes where
+// it wins in a window's profile (STRATA_METAL_KPROF): inputs of at most 2560 and outputs of at least 2048, not the wide
+// inputs (6144 -> 2560) or the small outputs (2560 -> 640).  From 3 tokens on (STRATA_METAL_MMA_MIN; 0: never).  The
+// sums run in another order than the per-lane kernel's.
+bool mma_window(int type, int n_in, int n_out, int ntok) {
+    static const int mn = [] { const char* e = std::getenv("STRATA_METAL_MMA_MIN"); return e ? std::atoi(e) : 3; }();
+    return mn > 0 && ntok >= mn && (type == ref::Q8_0 || type == ref::Q4_0) && n_in % 128 == 0 && n_in <= 2560 && n_out >= 2048;
+}
 struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; };
 struct MoeArgs {
     uint64_t gate_off, up_off, down_off, gu_stride, d_stride;
@@ -603,7 +614,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     }
     n_vocab_ = (int64_t) T("output.weight").shape[1];
     if (const gguf::Tensor* e0 = f_.find("blk.0.ffn_gate_exps.weight")) gyro_dense_ = e0->type >= 144;
-    lib_ = cx_->compile({"quant.metal", "units.metal", "moe.metal", "gemv.metal", "router.metal", "gr.metal", "gr2.metal",
+    lib_ = cx_->compile({"quant.metal", "units.metal", "moe.metal", "gemv.metal", "mma.metal", "router.metal", "gr.metal", "gr2.metal",
                          "glue.metal"});
     rcounter_ = cx_->alloc(16);
     lgdn_ = cx_->compile({"gdn.metal"}, "#define NO_GGML_COMMON 1\n");
@@ -954,6 +965,17 @@ void Window::gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const A
             else if (n_in == N && n_out >= 10240) { L = 8; Rr = 1; S = 8; K = 1; }
             else if (n_in == N && n_out == 6144) { L = 8; Rr = 2; S = 4; K = 1; }
         }
+    }
+    if (mma_window(ty, n_in, n_out, ntok)) {
+        const std::string fn = "gemv_mma_" + std::to_string(ty) + "_1";
+        MmaArgs a{(uint32_t) n_in, (uint32_t) n_out, (uint32_t) ref::row_bytes(ty, n_in), (uint32_t) n_in, (uint32_t) y_stride};
+        mtl::Dispatch d;
+        d.p = P(lib_, fn, mtl::Constants().i(4, ntok), fn + "#" + std::to_string(ntok));
+        d.args = {mtl::Arg::B(wb ? *wb : W_, t.offset), mtl::Arg::B(x.b, 0), mtl::Arg::B(y, y_off), mtl::Arg::V(a)};
+        d.grid[0] = (n_out + 7) / 8;
+        d.tg[0] = 32;
+        push(ds, d);
+        return;
     }
     const std::string fn = "gemv_" + std::to_string(ty) + "_" + std::to_string(L) + "_" + std::to_string(Rr) + "_" +
                            std::to_string(S) + "_" + std::to_string(K);
