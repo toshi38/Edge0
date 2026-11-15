@@ -107,6 +107,25 @@ The engine wires the whole pack once the GPU has used it: about 50 GB on the 145
 - Commit messages name the issue (`refs #3`, `closes #1`).
 - Every claim of speed or correctness comes with the measurement and how it was taken. An estimate is labelled as one.
 
+## Before a long eval run or a pull request: review and test first
+
+Both cost hours or other people's attention, so the cheap checks come before, not after.
+
+Before a long eval run:
+
+- Smoke-test every step of the run end to end on something small (a tiny model, or two or three items of each suite) and read the output of each step, including the files it writes. A step that silently records harness errors as wrong answers wastes the whole run.
+- Check the machine: power (`pmset -g batt`, and the adapter's wattage: a weak charger drains the battery and macOS then throttles the GPU to a tenth of its speed), free memory, and that nothing else heavy is running. Never build while an engine is serving.
+- A few minutes into the run, read the per-request tok/s in the engine log. Timings from the first minutes after a start, or from a throttled machine, are not results.
+- A change to the engine gets its correctness check first (`logprobe.py --diff` against the build it changes, the parity tests), then the long suites.
+
+Before opening a pull request, here or upstream:
+
+- Have each change reviewed independently before it is offered: one reviewer per change, given the diff and the surrounding code and asked what would break, not told that it works. Check every finding against the code, fix what is real, and say in the description what was found and left.
+- Prove each change alone, built by itself on the branch it targets: output unchanged (or the intended change shown), the effect it claims measured, with the commands.
+- Run every check the target repository asks for (its PR template, its testing guide, its benchmark), whether or not the change seems to touch what the check covers. It is their repository and they asked. If a check needs something that is not on the machine (a model, fixtures), get it and run it. If one truly cannot be run, the description says which and why.
+- A description claims only what was run on that branch. A result from another branch or another engine is named as such or left out.
+- Pull requests are opened as drafts and stay drafts until the reviews are answered, the checks have run and the description matches the branch.
+
 ## Pushing
 
 Push to the fork as work lands: after each commit or small group of commits that builds and passes `latent_parity`. Unpushed work is unbacked work. The fork is public, so every push is checked first:
