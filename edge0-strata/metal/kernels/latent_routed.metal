@@ -155,6 +155,50 @@ kernel void latent_group_u(device const uchar* weights [[buffer(0)]],
     if (lane % Lanes == 0) output[slot * a.hidden + row] = y;
 }
 
+// latent_group_u for a window of several tokens: tg.y is the group, and each lane decodes its units of a row once and
+// takes one dot per token from them. A token's sum is formed exactly as latent_group_u forms it, so the outputs are
+// bit-equal; the group's weights are read once a window, not once a token.
+constant int LATENT_NTOK [[function_constant(0)]];   // tokens of the window (1..8): the token loops are specialised
+template <int Lanes>
+kernel void latent_group_u_window(device const uchar* weights [[buffer(0)]],
+                                  device const float* group_rows [[buffer(1)]],
+                                  device const uint* active [[buffer(2)]],
+                                  device float* output [[buffer(3)]],
+                                  constant LatentRoutedArgs& a [[buffer(4)]],
+                                  uint2 tg [[threadgroup_position_in_grid]],
+                                  ushort sg [[simdgroup_index_in_threadgroup]],
+                                  ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup uint table[1];
+    const uint group = tg.y, row = (4 * tg.x + sg) * (32 / Lanes) + lane / Lanes;
+    if (row >= a.hidden) return;
+    float sum[8];
+    bool used[8];
+    bool any_used = false;
+    for (int token = 0; token < LATENT_NTOK; ++token) {
+        sum[token] = 0.0f;
+        used[token] = active[token * a.groups + group] != 0;
+        any_used = any_used || used[token];
+    }
+    if (any_used) {
+        device const uchar* w = weights + (group * a.hidden + row) * a.u_row;
+        for (uint unit = lane % Lanes; unit < a.latent / 32; unit += Lanes) {
+            float codes[32];
+            const float scale = deq<T_Q4_0>(w + unit * fmt<T_Q4_0>::BB, 0, codes, table);
+            for (int token = 0; token < LATENT_NTOK; ++token) {
+                if (!used[token]) continue;
+                device const float* x = group_rows + (token * a.groups + group) * a.latent + 32 * unit;
+                float dot = 0.0f;
+                for (uint j = 0; j < 32; ++j) dot = fma(codes[j], x[j], dot);
+                sum[token] = fma(scale, dot, sum[token]);
+            }
+        }
+    }
+    for (int token = 0; token < LATENT_NTOK; ++token) {
+        const float y = used[token] ? lane_sum<Lanes>(sum[token]) : 0.0f;
+        if (lane % Lanes == 0) output[(token * a.groups + group) * a.hidden + row] = y;
+    }
+}
+
 template [[host_name("latent_gate_up")]] kernel decltype(latent_gate_up<32>) latent_gate_up<32>;
 template [[host_name("latent_down")]] kernel decltype(latent_down<32>) latent_down<32>;
 template [[host_name("latent_group_u")]] kernel decltype(latent_group_u<32>) latent_group_u<32>;
@@ -164,6 +208,9 @@ template [[host_name("latent_gate_up_4")]] kernel decltype(latent_gate_up<4>) la
 template [[host_name("latent_down_4")]] kernel decltype(latent_down<4>) latent_down<4>;
 template [[host_name("latent_group_u_8")]] kernel decltype(latent_group_u<8>) latent_group_u<8>;
 template [[host_name("latent_group_u_4")]] kernel decltype(latent_group_u<4>) latent_group_u<4>;
+template [[host_name("latent_group_u_window")]] kernel decltype(latent_group_u_window<32>) latent_group_u_window<32>;
+template [[host_name("latent_group_u_window_8")]] kernel decltype(latent_group_u_window<8>) latent_group_u_window<8>;
+template [[host_name("latent_group_u_window_4")]] kernel decltype(latent_group_u_window<4>) latent_group_u_window<4>;
 
 kernel void latent_group_combine(device const float* grouped [[buffer(0)]],
                                  device const float* shared [[buffer(1)]],
